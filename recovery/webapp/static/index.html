@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>File Recovery</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script>window.APP_TOKEN = "__TOKEN__";</script>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-logo">FR</div>
+      <div><h1>File Recovery</h1><small id="version">v-</small></div>
+    </div>
+    <button class="nav-item active" data-page="trash"><span class="nav-icon">🗑️</span><span class="nav-label">Recycle Bin</span></button>
+    <button class="nav-item" data-page="deleted"><span class="nav-icon">🔎</span><span class="nav-label">File dihapus</span></button>
+    <button class="nav-item" data-page="carve"><span class="nav-icon">🧩</span><span class="nav-label">Carving</span></button>
+    <button class="nav-item" data-page="image"><span class="nav-icon">💾</span><span class="nav-label">Salin disk</span></button>
+    <button class="nav-item" data-page="flash"><span class="nav-icon">🔌</span><span class="nav-label">Flashdisk</span></button>
+    <button class="nav-item" data-page="repair"><span class="nav-icon">🛠️</span><span class="nav-label">Perbaiki file</span></button>
+
+    <div class="sidebar-foot">
+      <span class="pill" id="pill-os"><span class="dot" id="dot-admin"></span><span id="pill-admin">-</span></span>
+      <button class="nav-item" id="theme-toggle"><span class="nav-icon">🌓</span><span class="nav-label">Tema</span></button>
+      <label class="nav-item" style="cursor:pointer">
+        <span class="nav-icon">🐞</span><span class="nav-label">Mode debug</span>
+        <span class="switch" style="margin-left:auto"><input type="checkbox" id="debug-toggle"><span></span></span>
+      </label>
+    </div>
+  </aside>
+
+  <main>
+    <!-- live job bar: visible while a job runs -->
+    <div class="jobbar" id="jobbar" hidden>
+      <div class="head">
+        <span class="spin" id="job-spin"></span>
+        <span class="title" id="job-title">Pekerjaan</span>
+        <span class="phase" id="job-phase"></span>
+        <span class="percent" id="job-percent"></span>
+        <button class="btn btn-sm" id="job-cancel">Batal</button>
+      </div>
+      <div class="progress indeterminate" id="job-progress" style="margin-top:10px"><span></span></div>
+      <div class="meta" id="job-meta"></div>
+    </div>
+
+    <!-- PAGE: Recycle Bin -->
+    <section class="page" id="page-trash">
+      <div class="page-head"><div><h2>Recycle Bin / Trash</h2><p>Pulihkan file yang baru dihapus dari tempat sampah.</p></div></div>
+      <div class="grid">
+        <div class="card col-12">
+          <div class="row">
+            <div class="field"><label>Dihapus dari</label><input type="date" id="trash-from"></div>
+            <div class="field"><label>Sampai</label><input type="date" id="trash-to"></div>
+            <div class="field" style="flex:0 0 auto"><label>&nbsp;</label>
+              <div class="input-group"><button class="btn" id="trash-apply">Terapkan</button>
+              <button class="btn btn-ghost" id="trash-clear">Hapus filter</button></div>
+            </div>
+          </div>
+        </div>
+        <div class="card col-12">
+          <div class="card-head">
+            <div class="stats" style="flex:1">
+              <div class="stat"><div class="label">Item</div><div class="value" id="trash-count">0</div></div>
+              <div class="stat"><div class="label">Dipilih</div><div class="value" id="trash-selected">0</div></div>
+            </div>
+            <button class="btn btn-primary" id="trash-restore" disabled>Pulihkan yang dipilih</button>
+          </div>
+          <div class="table-wrap">
+            <table><thead><tr><th style="width:36px"><input type="checkbox" id="trash-all"></th><th>Nama</th><th class="num">Ukuran</th><th>Dihapus</th><th>Lokasi asal</th></tr></thead>
+            <tbody id="trash-body"></tbody></table>
+          </div>
+          <div class="muted small" style="margin-top:8px">Waktu hapus diambil dari metadata trash. Kosongkan tanggal untuk menampilkan semua.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- PAGE: deleted files with names -->
+    <section class="page" id="page-deleted" hidden>
+      <div class="page-head"><div><h2>File dihapus dengan nama asli</h2><p>Membaca tabel file sistem. Butuh pytsk3. Waktu hapus adalah perkiraan.</p></div></div>
+      <div class="grid">
+        <div class="card col-12">
+          <div class="row">
+            <div class="field"><label>Sumber (disk / image)</label>
+              <div class="input-group"><select id="fs-disk"></select><button class="btn" data-browse="fs-src" data-mode="file">Pilih file</button></div>
+              <input type="text" id="fs-src" placeholder="contoh: \\.\C: atau D:\disk.img" style="margin-top:6px">
+            </div>
+            <div class="field" style="flex:0 0 auto"><label>Dihapus dari</label><input type="date" id="fs-from"></div>
+            <div class="field" style="flex:0 0 auto"><label>Sampai</label><input type="date" id="fs-to"></div>
+            <div class="field" style="flex:0 0 auto"><label>&nbsp;</label><button class="btn btn-primary" id="fs-scan">Cari file dihapus</button></div>
+          </div>
+        </div>
+        <div class="card col-12">
+          <div class="card-head">
+            <div class="stats" style="flex:1">
+              <div class="stat"><div class="label">Ditemukan</div><div class="value" id="fs-total">0</div></div>
+              <div class="stat"><div class="label">Ditampilkan</div><div class="value" id="fs-shown">0</div></div>
+              <div class="stat"><div class="label">Dipilih</div><div class="value" id="fs-selected">0</div></div>
+            </div>
+          </div>
+          <div class="toolbar">
+            <input type="search" id="fs-match" placeholder="Cari nama atau path..." style="max-width:320px">
+            <button class="btn btn-sm" id="fs-select-all">Pilih semua</button>
+            <button class="btn btn-sm" id="fs-preview" disabled>Pratinjau</button>
+            <span class="spacer"></span>
+            <a class="btn btn-sm" href="#" id="fs-export-csv">Ekspor CSV</a>
+            <a class="btn btn-sm" href="#" id="fs-export-json">Ekspor JSON</a>
+            <button class="btn btn-primary" id="fs-recover" disabled>Pulihkan yang dipilih</button>
+          </div>
+          <div class="table-wrap">
+            <table><thead><tr><th style="width:36px"></th><th>Path file</th><th class="num">Ukuran</th><th>Sistem file</th><th>Dihapus (perkiraan)</th></tr></thead>
+            <tbody id="fs-body"></tbody></table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- PAGE: carving -->
+    <section class="page" id="page-carve" hidden>
+      <div class="page-head"><div><h2>Pulihkan dari disk (carving)</h2><p>Mencari file berdasarkan isinya, tanpa metadata. Cocok untuk format cepat atau hapus permanen.</p></div></div>
+      <div class="grid">
+        <div class="card col-12">
+          <div class="row">
+            <div class="field"><label>Sumber (disk / image)</label>
+              <div class="input-group"><select id="carve-disk"></select><button class="btn" data-browse="carve-src" data-mode="file">Pilih file</button></div>
+              <input type="text" id="carve-src" placeholder="contoh: \\.\E: atau D:\disk.img" style="margin-top:6px">
+            </div>
+            <div class="field"><label>Simpan hasil ke</label>
+              <div class="input-group"><input type="text" id="carve-out"><button class="btn" data-browse="carve-out" data-mode="dir">Pilih folder</button></div>
+            </div>
+          </div>
+          <div class="row" style="margin-top:14px">
+            <div class="field" style="flex:0 0 auto"><label>Tanggal di dalam file dari</label><input type="date" id="carve-from"></div>
+            <div class="field" style="flex:0 0 auto"><label>sampai</label><input type="date" id="carve-to"></div>
+            <div class="muted small" style="flex:1 1 260px">Kosong = semua file. Tanggal diambil dari isi file (EXIF foto, PDF, ZIP), bukan tanggal hapus.</div>
+          </div>
+        </div>
+        <div class="card col-12">
+          <div class="card-head"><h3 style="margin:0">Jenis file</h3>
+            <div class="toolbar" style="margin:0"><button class="btn btn-sm" id="ext-all">Pilih semua</button><button class="btn btn-sm" id="ext-none">Kosongkan</button></div></div>
+          <div class="chips" id="ext-chips"></div>
+        </div>
+        <div class="card col-12">
+          <div class="card-head">
+            <div class="stats" style="flex:1">
+              <div class="stat"><div class="label">Ditulis</div><div class="value" id="carve-recovered">0</div></div>
+              <div class="stat"><div class="label">Utuh</div><div class="value" id="carve-complete">0</div></div>
+              <div class="stat"><div class="label">Di luar tanggal</div><div class="value" id="carve-skipped">0</div></div>
+            </div>
+            <button class="btn btn-primary" id="carve-start">Mulai pemindaian</button>
+          </div>
+          <div class="muted small" id="carve-result">Belum ada hasil.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- PAGE: disk imaging -->
+    <section class="page" id="page-image" hidden>
+      <div class="page-head"><div><h2>Salin disk ke image</h2><p>Buat cadangan lengkap sebelum pemulihan. Sektor rusak diisi nol dan dicatat. Hash SHA-256 disimpan.</p></div></div>
+      <div class="grid">
+        <div class="card col-12">
+          <div class="row">
+            <div class="field"><label>Disk / partisi yang disalin</label>
+              <div class="input-group"><select id="image-disk"></select><button class="btn" data-browse="image-src" data-mode="file">Pilih file</button></div>
+              <input type="text" id="image-src" style="margin-top:6px">
+            </div>
+            <div class="field"><label>File image tujuan</label>
+              <div class="input-group"><input type="text" id="image-out"><button class="btn" data-browse="image-out" data-mode="save">Simpan ke</button></div>
+            </div>
+          </div>
+          <div class="toolbar"><button class="btn btn-primary" id="image-start">Mulai salin</button></div>
+          <div class="muted small" id="image-result">Belum ada hasil.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- PAGE: flashdisk -->
+    <section class="page" id="page-flash" hidden>
+      <div class="page-head"><div><h2>Flashdisk & memori</h2><p>Untuk USB, kartu memori, dan perangkat yang RAW atau tidak terbaca. Urutan aman: diagnosa, salin, pulihkan, lalu perbaiki.</p></div></div>
+      <div class="grid">
+        <div class="card col-12">
+          <div class="row">
+            <div class="field"><label>Perangkat</label>
+              <div class="input-group"><select id="flash-disk"></select><button class="btn" data-browse="flash-src" data-mode="file">File image</button></div>
+              <input type="text" id="flash-src" style="margin-top:6px">
+            </div>
+          </div>
+        </div>
+        <div class="card col-12">
+          <div class="stats">
+            <div class="stat"><div class="label">1. Diagnosa</div><div class="muted small" style="margin:6px 0 10px">Membaca boot sector dan mengenali sistem file.</div><button class="btn btn-primary btn-sm" id="flash-diag">Diagnosa</button></div>
+            <div class="stat"><div class="label">2. Uji permukaan</div><div class="muted small" style="margin:6px 0 10px">Membaca semua sektor. Tidak menulis.</div><button class="btn btn-sm" id="flash-surface">Mulai uji</button></div>
+            <div class="stat"><div class="label">3. Salin ke image</div><div class="muted small" style="margin:6px 0 10px">Cadangan sebelum perbaikan apa pun.</div><button class="btn btn-sm" id="flash-image">Salin</button></div>
+            <div class="stat"><div class="label">4. Pulihkan dari image</div><div class="muted small" style="margin:6px 0 10px">Carving dari file cadangan.</div><button class="btn btn-sm" id="flash-carve">Ke carving</button></div>
+          </div>
+        </div>
+        <div class="card col-6">
+          <h3>Cek sistem file (aman)</h3>
+          <p class="muted small">Hanya memeriksa, tidak mengubah data. Windows: chkdsk tanpa /f. Linux: fsck -n. macOS: verifyVolume.</p>
+          <button class="btn" id="flash-check">Cek sekarang</button>
+        </div>
+        <div class="card col-6">
+          <h3>5. Perbaiki sistem file <span class="tag bad">menulis</span></h3>
+          <p class="muted small">Menulis ke perangkat. Salin ke image dulu. Perangkat sistem tidak akan diperbaiki.</p>
+          <button class="btn btn-danger" id="flash-fix">Perbaiki…</button>
+        </div>
+        <div class="card col-12">
+          <h3>Hasil</h3>
+          <div id="flash-result" class="muted">Belum ada hasil.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- PAGE: repair damaged files -->
+    <section class="page" id="page-repair" hidden>
+      <div class="page-head"><div><h2>Perbaiki file rusak</h2><p>PNG, JPEG, PDF, ZIP/DOCX/XLSX/PPTX/APK, dan SQLite. File asli tidak diubah.</p></div></div>
+      <div class="grid">
+        <div class="card col-12">
+          <div class="row">
+            <div class="field"><label>File atau folder yang rusak</label>
+              <div class="input-group"><input type="text" id="repair-src"><button class="btn" data-browse="repair-src" data-mode="any">Pilih</button></div></div>
+            <div class="field"><label>Simpan hasil ke</label>
+              <div class="input-group"><input type="text" id="repair-out"><button class="btn" data-browse="repair-out" data-mode="dir">Pilih folder</button></div></div>
+          </div>
+          <div class="toolbar"><button class="btn btn-primary" id="repair-start">Perbaiki</button></div>
+        </div>
+        <div class="card col-12">
+          <div class="stats" style="margin-bottom:12px">
+            <div class="stat"><div class="label">Berhasil</div><div class="value" id="repair-ok">0</div></div>
+            <div class="stat"><div class="label">Total</div><div class="value" id="repair-total">0</div></div>
+          </div>
+          <div class="table-wrap"><table><thead><tr><th>File</th><th>Status</th><th>Tindakan</th></tr></thead><tbody id="repair-body"></tbody></table></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- Debug drawer -->
+<section class="debug" id="debug" hidden>
+  <div class="bar">
+    <b>Mode debug</b>
+    <span class="tag" id="dbg-state">idle</span>
+    <span class="muted small" id="dbg-count"></span>
+    <span class="spacer"></span>
+    <select id="dbg-level" style="width:auto">
+      <option value="ALL" selected>Semua level</option><option value="DEBUG">DEBUG</option>
+      <option value="INFO">INFO</option><option value="WARNING">WARNING</option><option value="ERROR">ERROR</option>
+    </select>
+    <label class="small muted"><input type="checkbox" id="dbg-follow" checked> ikuti</label>
+    <button class="btn btn-sm" id="dbg-copy">Salin log</button>
+    <button class="btn btn-sm" id="dbg-clear">Bersihkan</button>
+    <button class="btn btn-sm btn-icon" id="dbg-close" title="Tutup">✕</button>
+  </div>
+  <div class="body">
+    <div class="status" id="dbg-status"></div>
+    <div class="log" id="dbg-log"></div>
+  </div>
+</section>
+
+<div class="toasts" id="toasts"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
