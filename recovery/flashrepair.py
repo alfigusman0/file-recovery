@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from .carver import read_at, source_size
+from .flashcheck import (NOT_RESPONDING, PROBE_TIMEOUT, READ_TIMEOUT, STUCK, DeviceNotResponding,
+                         GuardedWorker, device_key, run_with_timeout)
 from .platform_info import current_os
 from .safety import is_device_path
 
@@ -53,6 +55,8 @@ class SurfaceResult:
     bytes_read: int
     bad_ranges: list[tuple[int, int]]
     cancelled: bool
+    stuck: bool = False         # the device stopped answering ('tidak merespons'); scan stopped
+    message: str = ""
 
     @property
     def bad_bytes(self) -> int:
@@ -60,7 +64,7 @@ class SurfaceResult:
 
     @property
     def healthy(self) -> bool:
-        return not self.bad_ranges and not self.cancelled
+        return not self.bad_ranges and not self.cancelled and not self.stuck
 
 
 def _fs_name(ftype: int) -> str:
@@ -73,8 +77,23 @@ def _fs_name(ftype: int) -> str:
     return "tidak dikenali"
 
 
-def diagnose(device: str) -> Diagnosis:
-    """Read-only check of the boot sector and file system (needs pytsk3 for the file system name)."""
+def diagnose(device: str, timeout: Optional[float] = PROBE_TIMEOUT) -> Diagnosis:
+    """Read-only check of the boot sector and file system (needs pytsk3 for the file system name).
+
+    Runs in a guarded thread: after `timeout` seconds (None = no limit) the result has
+    status 'tidak merespons' and the device stays blocked for new probes during a cool-down.
+    """
+    if timeout is None:
+        return _diagnose(device)
+    res = run_with_timeout(_diagnose, device, timeout=timeout, key=device_key(device))
+    if res.ok:
+        return res.value
+    if res.timed_out:
+        return Diagnosis(device, 0, False, "-", NOT_RESPONDING, res.message)
+    raise res.exception  # type: ignore[misc]
+
+
+def _diagnose(device: str) -> Diagnosis:
     try:
         with open(device, "rb", buffering=0) as f:
             size = source_size(f)
@@ -140,13 +159,53 @@ def surface_scan(
     device: str,
     progress: Optional[Callable[[int, int], None]] = None,
     cancel: Optional[threading.Event] = None,
+    read_timeout: Optional[float] = READ_TIMEOUT,
+    open_timeout: float = PROBE_TIMEOUT,
 ) -> SurfaceResult:
-    """Read every sector without writing. Unreadable sectors are recorded, not fixed."""
+    """Read every sector without writing. Unreadable sectors are recorded, not fixed.
+
+    Every open and read runs in a guarded worker thread. If one passes its timeout the
+    scan stops with stuck=True ('tidak merespons') instead of hanging, and the device is
+    put in a cool-down. read_timeout=None disables the guard. Raises DeviceNotResponding
+    when the device is still in its cool-down from an earlier hang.
+    """
+    if read_timeout is None:
+        with open(device, "rb", buffering=0) as f:
+            return _surface_loop(f, lambda fn, *a: fn(*a), progress, cancel)
+
+    key = device_key(device)
+    if STUCK.is_stuck(key):
+        raise DeviceNotResponding(STUCK.message(key), key)
+    worker = GuardedWorker(key)
+    f = None
+    try:
+        try:
+            f = worker.call(open, device, "rb", 0, timeout=open_timeout)
+        except DeviceNotResponding as exc:
+            return SurfaceResult(0, 0, [], False, stuck=True, message=str(exc))
+
+        def call(fn, *args):
+            return worker.call(fn, *args, timeout=read_timeout)
+
+        return _surface_loop(f, call, progress, cancel)
+    finally:
+        if f is not None and not worker.broken:
+            try:
+                worker.call(f.close, timeout=open_timeout)
+            except (OSError, DeviceNotResponding):
+                pass
+        elif f is not None:
+            worker.after_exit(f.close)  # close the handle once the blocked read returns
+        worker.close()
+
+
+def _surface_loop(f, call, progress, cancel) -> SurfaceResult:
     bad: list[tuple[int, int]] = []
     done = 0
     cancelled = False
-    with open(device, "rb", buffering=0) as f:
-        total = source_size(f)
+    total = 0
+    try:
+        total = call(source_size, f)
         pos = 0
         while total == 0 or pos < total:
             if cancel is not None and cancel.is_set():
@@ -154,7 +213,7 @@ def surface_scan(
                 break
             want = min(SURFACE_BLOCK, total - pos) if total else SURFACE_BLOCK
             try:
-                block = read_at(f, pos, want)
+                block = call(read_at, f, pos, want)
             except OSError:
                 block = b""
             if not block:
@@ -164,7 +223,7 @@ def surface_scan(
                 for off in range(0, want, SUB_BLOCK):
                     length = min(SUB_BLOCK, want - off)
                     try:
-                        part = read_at(f, pos + off, length)
+                        part = call(read_at, f, pos + off, length)
                     except OSError:
                         part = b""
                     if part:
@@ -183,6 +242,9 @@ def surface_scan(
             done = pos
             if progress:
                 progress(done, total)
+    except DeviceNotResponding as exc:
+        return SurfaceResult(total, done, bad, cancelled, stuck=True,
+                             message=f"{exc} Pemindaian berhenti di {done // (1024 * 1024)} MB.")
     return SurfaceResult(total, done, bad, cancelled)
 
 

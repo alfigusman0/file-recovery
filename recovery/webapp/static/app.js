@@ -9,7 +9,29 @@
     trash_restore: "Pulihkan dari trash", fs_scan: "Mencari file dihapus", fs_recover: "Memulihkan file",
     fs_preview: "Menyiapkan pratinjau", carve: "Pemindaian carving", image: "Menyalin disk",
     repair: "Memperbaiki file", flash_diag: "Diagnosa perangkat", flash_surface: "Uji permukaan",
-    flash_repair: "Perbaikan sistem file",
+    flash_repair: "Perbaikan sistem file", capacity: "Uji kapasitas", capacity_test: "Uji kapasitas",
+    flash_capacity: "Uji kapasitas",
+  };
+  // Job names onJobDone knows; any other name falls back to the handler that started the job.
+  const KNOWN_JOBS = new Set(["trash_restore", "fs_scan", "fs_recover", "fs_preview", "carve", "image",
+    "repair", "flash_diag", "flash_surface", "flash_repair", "capacity"]);
+  const CAPACITY_ALIASES = new Set(["capacity", "capacity_test", "flash_capacity"]);
+  const MAX_ROWS = 2000;  // rows drawn per table; filters still count everything
+  const CONFIDENCE = {
+    high: { label: "Tinggi", tone: "ok",
+      tip: "Keyakinan tinggi: struktur file lengkap dan cocok dari awal sampai akhir. Kemungkinan besar file bisa dibuka normal." },
+    medium: { label: "Sedang", tone: "warn",
+      tip: "Keyakinan sedang: awal file dan sebagian strukturnya cocok, tetapi ada bagian yang tidak bisa dipastikan. File mungkin terbuka dengan sedikit kerusakan." },
+    low: { label: "Rendah", tone: "bad",
+      tip: "Keyakinan rendah: hanya tanda awal file yang cocok. Isinya bisa terpotong atau tercampur data lain." },
+  };
+  const STUCK_TIP = "Perangkat tidak merespons. Cabut drive, colok kembali, lalu muat ulang daftar disk.";
+  // source input -> operation buttons that must stay disabled while that source is a stuck device
+  const STUCK_TARGETS = {
+    fs: { src: "fs-src", buttons: ["fs-scan"] },
+    carve: { src: "carve-src", buttons: ["carve-start"] },
+    image: { src: "image-src", buttons: ["image-start"] },
+    flash: { src: "flash-src", buttons: ["flash-diag", "flash-surface", "flash-image", "flash-carve", "flash-check", "flash-fix"] },
   };
 
   const $ = (id) => document.getElementById(id);
@@ -17,7 +39,8 @@
   const state = {
     page: "trash", job: null, pollTimer: null, debugOn: false, debugTimer: null, lastSeq: 0,
     trash: [], trashSel: new Set(), fs: [], fsSel: new Set(), fsTotal: 0,
-    exts: new Set(EXTS), repairRows: [], disks: [],
+    exts: new Set(EXTS), repairRows: [], disks: [], stuck: new Set(),
+    carve: [], lastHandler: null, filters: {},
   };
 
   // ---------- helpers ----------
@@ -72,6 +95,120 @@
   }
   function dateRange(fromId, toId) {
     return { from: $(fromId).value || "", to: $(toId).value || "" };
+  }
+  function baseName(p) { return String(p || "").split(/[\\/]/).filter(Boolean).pop() || String(p || ""); }
+
+  // ---------- result filters (client-side) ----------
+
+  // Derived fields used by the filters, cached on the item.
+  function facts(it) {
+    if (it._f) return it._f;
+    const path = it.path || it.output || it.file || it.name || "";
+    const name = it.name || baseName(path);
+    let ext = String(it.ext || it.extension || "").toLowerCase().replace(/^\./, "");
+    if (!ext) { const m = /\.([a-z0-9]{1,8})$/i.exec(name); ext = m ? m[1].toLowerCase() : ""; }
+    let status = null;
+    if (typeof it.complete === "boolean") status = it.complete ? "utuh" : "sebagian";
+    else if (typeof it.partial === "boolean") status = it.partial ? "sebagian" : "utuh";
+    else if (it.status) {
+      const s = String(it.status).toLowerCase();
+      if (["utuh", "complete", "full", "ok"].includes(s)) status = "utuh";
+      else if (["sebagian", "partial", "truncated"].includes(s)) status = "sebagian";
+    }
+    const rawSize = it.size ?? it.length ?? it.bytes;
+    const size = rawSize === null || rawSize === undefined || rawSize === "" ? null : Number(rawSize);
+    const conf = String(it.confidence || "").toLowerCase();
+    Object.defineProperty(it, "_f", {
+      value: { path, name, ext, status, size: Number.isFinite(size) ? size : null,
+               confidence: CONFIDENCE[conf] ? conf : null, hay: (name + "\n" + path).toLowerCase() },
+      enumerable: false,
+    });
+    return it._f;
+  }
+
+  function statusTag(status) {
+    if (status === "utuh") return `<span class="tag ok">Utuh</span>`;
+    if (status === "sebagian") return `<span class="tag warn">Sebagian</span>`;
+    return `<span class="muted">-</span>`;
+  }
+  function confidenceBadge(level) {
+    const c = CONFIDENCE[level];
+    if (!c) return "";
+    return `<span class="tag ${c.tone} conf" title="${esc(c.tip)}" aria-label="${esc(c.tip)}" tabindex="0">${c.label}</span>`;
+  }
+
+  // Builds a filter bar into #<key>-filters. onChange() is called (debounced for typing) on any change.
+  function makeFilter(key, onChange) {
+    const root = $(`${key}-filters`);
+    const id = (n) => `${key}-f-${n}`;
+    root.innerHTML = `
+      <div class="field f-search"><label for="${id("q")}">Cari nama / path</label>
+        <input type="search" id="${id("q")}" placeholder="Ketik nama file atau folder…" autocomplete="off"></div>
+      <div class="field"><label for="${id("type")}">Jenis file</label>
+        <select id="${id("type")}"><option value="">Semua jenis</option></select></div>
+      <div class="field"><label for="${id("min")}">Ukuran min (MB)</label>
+        <input type="number" id="${id("min")}" min="0" step="any" inputmode="decimal" placeholder="0"></div>
+      <div class="field"><label for="${id("max")}">Ukuran maks (MB)</label>
+        <input type="number" id="${id("max")}" min="0" step="any" inputmode="decimal" placeholder="tanpa batas"></div>
+      <div class="field" id="${id("status-wrap")}"><label for="${id("status")}">Status</label>
+        <select id="${id("status")}"><option value="">Semua status</option>
+          <option value="utuh">Utuh</option><option value="sebagian">Sebagian</option></select></div>
+      <div class="f-foot"><span class="small f-count" id="${id("count")}" aria-live="polite">menampilkan 0 dari 0</span>
+        <button type="button" class="btn btn-sm" id="${id("reset")}" disabled>Reset filter</button></div>`;
+    let timer = null;
+    const fire = () => { clearTimeout(timer); onChange(); };
+    const later = () => { clearTimeout(timer); timer = setTimeout(onChange, 180); };
+    $(id("q")).addEventListener("input", later);
+    $(id("min")).addEventListener("input", later);
+    $(id("max")).addEventListener("input", later);
+    $(id("type")).addEventListener("change", fire);
+    $(id("status")).addEventListener("change", fire);
+    $(id("reset")).addEventListener("click", () => {
+      ["q", "min", "max", "type", "status"].forEach((n) => { $(id(n)).value = ""; });
+      fire();
+    });
+
+    const read = () => {
+      const mb = (n) => { const v = $(id(n)).value.trim(); const x = Number(v); return v === "" || !Number.isFinite(x) ? null : x * 1024 * 1024; };
+      return { q: $(id("q")).value.trim().toLowerCase(), type: $(id("type")).value,
+               min: mb("min"), max: mb("max"), status: $(id("status")).value };
+    };
+    return {
+      // Refresh the type/status options from the full list (keeps the current choice if still valid).
+      setItems(items) {
+        const types = [...new Set(items.map((it) => facts(it).ext))].sort();
+        const sel = $(id("type")), prev = sel.value;
+        sel.innerHTML = `<option value="">Semua jenis</option>` + types.map((t) =>
+          `<option value="${esc(t)}">${t ? esc(t.toUpperCase()) : "(tanpa ekstensi)"}</option>`).join("");
+        sel.value = types.includes(prev) ? prev : "";
+        const hasStatus = items.some((it) => facts(it).status);
+        $(id("status-wrap")).hidden = !hasStatus;
+        if (!hasStatus) $(id("status")).value = "";
+        return hasStatus;
+      },
+      apply(items) {
+        const f = read();
+        const active = !!(f.q || f.type || f.min !== null || f.max !== null || f.status);
+        const out = active ? items.filter((it) => {
+          const x = facts(it);
+          if (f.q && !x.hay.includes(f.q)) return false;
+          if (f.type && x.ext !== f.type) return false;
+          if (f.min !== null && (x.size === null || x.size < f.min)) return false;
+          if (f.max !== null && (x.size === null || x.size > f.max)) return false;
+          if (f.status && x.status !== f.status) return false;
+          return true;
+        }) : items;
+        $(id("count")).textContent = `menampilkan ${out.length.toLocaleString("id-ID")} dari ${items.length.toLocaleString("id-ID")}`;
+        $(id("reset")).disabled = !active;
+        return out;
+      },
+    };
+  }
+
+  function limitNote(elId, shown) {
+    const el = $(elId);
+    el.hidden = shown <= MAX_ROWS;
+    el.textContent = `Tabel hanya menampilkan ${MAX_ROWS.toLocaleString("id-ID")} baris pertama. Persempit filter untuk melihat sisanya.`;
   }
 
   // ---------- modal ----------
@@ -143,7 +280,7 @@
     $$(".page").forEach((s) => s.hidden = s.id !== `page-${page}`);
     if (page === "trash") loadTrash();
     if (page === "deleted") loadFs();
-    if (page === "flash") { /* nothing to load */ }
+    refreshStuck();  // sources may have been filled in programmatically (e.g. flashdisk -> carving)
     history.replaceState(null, "", "#" + page);
   }
 
@@ -151,6 +288,8 @@
     try {
       await api(path, { method: "POST", body });
       state.job = { name: handlerName };
+      state.lastHandler = handlerName;
+      syncRunning();
       showJobBar(handlerName, "Memulai…", 0);
       poll();
       return true;
@@ -158,6 +297,11 @@
       toast("Tidak bisa memulai", err.message, "err");
       return false;
     }
+  }
+
+  // Controls that must not start a second job while one runs.
+  function syncRunning() {
+    setBusyButton($("cap-start"), !!state.job, "Pekerjaan berjalan…");
   }
 
   function showJobBar(name, phase, percent) {
@@ -185,10 +329,12 @@
         if (job.state === "running") { poll(); return; }
         $("jobbar").hidden = true;
         state.job = null;
+        syncRunning();
         onJobDone(job);
       } catch (err) {
         toast("Koneksi putus", err.message, "err");
         state.job = null;
+        syncRunning();
         $("jobbar").hidden = true;
       }
     }, 500);
@@ -198,7 +344,10 @@
     const r = job.result || {};
     if (job.state === "error") { toast("Gagal", job.error || "error tidak diketahui", "err"); return; }
     if (job.state === "cancelled") toast("Dibatalkan", JOB_TITLES[job.name] || job.name);
-    switch (job.name) {
+    let name = job.name;
+    if (CAPACITY_ALIASES.has(name)) name = "capacity";
+    else if (!KNOWN_JOBS.has(name) && state.lastHandler) name = state.lastHandler;
+    switch (name) {
       case "trash_restore":
         toast("Selesai", `${r.ok} dari ${r.total} file dipulihkan ke ${r.dest}`, "ok"); loadTrash(); break;
       case "fs_scan":
@@ -213,7 +362,10 @@
         $("carve-skipped").textContent = r.skipped_by_date ?? 0;
         $("carve-result").textContent = `${job.state === "cancelled" ? "Dibatalkan. " : ""}Hasil di ${r.out || "-"}.`;
         toast(job.state === "cancelled" ? "Dibatalkan" : "Carving selesai", `${r.recovered ?? 0} file, ${r.complete ?? 0} utuh`, "ok");
+        setCarveFiles(r);
         break;
+      case "capacity":
+        renderCapacity(r, job.state === "cancelled"); break;
       case "image":
         $("image-result").innerHTML = `${job.state === "cancelled" ? "<b>Dibatalkan.</b> " : ""}Disalin ${fmtSize(r.bytes)} dari ${fmtSize(r.total)}.<br>
           SHA-256: <code>${esc(r.sha256)}</code>${r.bad_blocks ? `<br><span class="tag warn">${r.bad_blocks} blok rusak diisi nol</span>` : ""}`;
@@ -266,24 +418,33 @@
   async function loadFs() {
     try {
       const { from, to } = dateRange("fs-from", "fs-to");
-      const match = $("fs-match").value.trim();
-      const data = await api("/api/fs/entries?" + new URLSearchParams({ from, to, match }).toString());
-      state.fs = data.items; state.fsTotal = data.total;
+      // name/path search runs client-side in the filter bar
+      const data = await api("/api/fs/entries?" + new URLSearchParams({ from, to }).toString());
+      state.fs = data.items || []; state.fsTotal = data.total;
       $("fs-total").textContent = data.total;
+      const ids = new Set(state.fs.map((e) => e.id));
+      state.fsSel = new Set([...state.fsSel].filter((id) => ids.has(id)));
+      state.fsHasStatus = state.filters.fs.setItems(state.fs);
       renderFs();
     } catch (err) { toast("Gagal memuat daftar", err.message, "err"); }
   }
   function renderFs() {
-    $("fs-shown").textContent = state.fs.length;
+    const shown = state.filters.fs.apply(state.fs);
+    state.fsShown = shown;
+    const withStatus = !!state.fsHasStatus;
+    $$(".fs-status-col").forEach((th) => th.hidden = !withStatus);
+    const cols = withStatus ? 6 : 5;
+    $("fs-shown").textContent = shown.length;
     $("fs-selected").textContent = state.fsSel.size;
     $("fs-recover").disabled = state.fsSel.size === 0;
     $("fs-preview").disabled = state.fsSel.size !== 1;
-    $("fs-body").innerHTML = state.fs.length ? state.fs.map((e) => `
+    $("fs-body").innerHTML = shown.length ? shown.slice(0, MAX_ROWS).map((e) => `
       <tr class="${state.fsSel.has(e.id) ? "selected" : ""}">
         <td><input type="checkbox" data-id="${e.id}" ${state.fsSel.has(e.id) ? "checked" : ""}></td>
         <td class="path" title="${esc(e.path)}">${esc(e.path)}</td><td class="num">${fmtSize(e.size)}</td>
-        <td><span class="tag">${esc(e.fs)}</span></td><td>${fmtDate(e.deleted)}</td></tr>`).join("")
-      : `<tr><td colspan="5" class="empty">Belum ada hasil. Jalankan pencarian dulu.</td></tr>`;
+        <td><span class="tag">${esc(e.fs)}</span></td>${withStatus ? `<td>${statusTag(facts(e).status)}</td>` : ""}<td>${fmtDate(e.deleted)}</td></tr>`).join("")
+      : `<tr><td colspan="${cols}" class="empty">${state.fs.length ? "Tidak ada file yang cocok dengan filter." : "Belum ada hasil. Jalankan pencarian dulu."}</td></tr>`;
+    limitNote("fs-limit", shown.length);
     $$("#fs-body input[type=checkbox]").forEach((cb) => cb.onchange = () => {
       const id = Number(cb.dataset.id);
       cb.checked ? state.fsSel.add(id) : state.fsSel.delete(id);
@@ -341,6 +502,72 @@
     });
   }
 
+  // The carve result may carry a per-file list (with an optional 'confidence' field).
+  function setCarveFiles(r) {
+    const list = [r.files, r.items, r.results, r.recovered_files, r.recovered].find(Array.isArray);
+    state.carve = (list || []).filter((x) => x && typeof x === "object");
+    $("carve-files-card").hidden = !state.carve.length;
+    state.filters.carve.setItems(state.carve);
+    renderCarve();
+  }
+  function renderCarve() {
+    const shown = state.filters.carve.apply(state.carve);
+    const hasConf = state.carve.some((it) => facts(it).confidence);
+    $$(".carve-conf-col").forEach((el) => el.hidden = !hasConf);
+    const cols = hasConf ? 5 : 4;
+    $("carve-body").innerHTML = shown.length ? shown.slice(0, MAX_ROWS).map((it) => {
+      const x = facts(it);
+      return `<tr><td class="path" title="${esc(x.path)}">${esc(x.path || x.name)}</td>
+        <td>${x.ext ? `<span class="tag">${esc(x.ext.toUpperCase())}</span>` : "-"}</td>
+        <td class="num">${fmtSize(x.size)}</td><td>${statusTag(x.status)}</td>
+        ${hasConf ? `<td>${confidenceBadge(x.confidence)}</td>` : ""}</tr>`;
+    }).join("") : `<tr><td colspan="${cols}" class="empty">Tidak ada file yang cocok dengan filter.</td></tr>`;
+    limitNote("carve-limit", shown.length);
+  }
+
+  // ---------- capacity test ----------
+
+  function capacitySizeMb() {
+    const v = $("cap-size").value;
+    if (v !== "custom") return Number(v);
+    const n = Number($("cap-custom").value);
+    return Number.isFinite(n) && n >= 1 ? Math.floor(n) : null;
+  }
+  function firstOf(r, keys) {
+    for (const k of keys) if (r[k] !== undefined && r[k] !== null && r[k] !== "") return [k, r[k]];
+    return [null, null];
+  }
+  function fmtSpeed([key, v]) {
+    if (v === null) return "-";
+    if (typeof v === "string") return v;
+    const n = Number(v);
+    if (!Number.isFinite(n)) return "-";
+    return `${n.toFixed(1)} MB/s`;
+  }
+  function renderCapacity(r, cancelled) {
+    const verdict = r.verdict ? String(r.verdict) : (cancelled ? "Uji dibatalkan." : "Tidak ada kesimpulan dari server.");
+    let tone = "";
+    if (r.ok === true || r.genuine === true || r.passed === true) tone = "ok";
+    else if (r.ok === false || r.genuine === false || r.passed === false || r.fake === true) tone = "bad";
+    else if (/palsu|fake|rusak|gagal|tidak cocok|error/i.test(verdict)) tone = "bad";
+    const [, written] = firstOf(r, ["bytes_written", "written_bytes", "written"]);
+    const [, verified] = firstOf(r, ["bytes_verified", "verified_bytes", "verified", "bytes_ok"]);
+    // Server contract: write_mb_per_s / read_mb_per_s are always MB/s
+    const write = [null, r.write_mb_per_s ?? null];
+    const read = [null, r.read_mb_per_s ?? null];
+    const size = (v) => (typeof v === "number" || /^\d+$/.test(String(v ?? ""))) ? fmtSize(Number(v)) : (v ?? "-");
+    $("cap-result").className = "";
+    $("cap-result").innerHTML = `
+      <div class="verdict ${tone}">${cancelled ? `<span class="tag warn">dibatalkan</span> ` : ""}${esc(verdict)}</div>
+      <div class="stats" style="margin-top:12px">
+        <div class="stat"><div class="label">Ditulis</div><div class="value">${esc(size(written))}</div></div>
+        <div class="stat"><div class="label">Terverifikasi</div><div class="value">${esc(size(verified))}</div></div>
+        <div class="stat"><div class="label">Kecepatan tulis</div><div class="value">${esc(fmtSpeed(write))}</div></div>
+        <div class="stat"><div class="label">Kecepatan baca</div><div class="value">${esc(fmtSpeed(read))}</div></div>
+      </div>`;
+    toast(cancelled ? "Uji kapasitas dibatalkan" : "Uji kapasitas selesai", verdict, tone === "bad" ? "err" : "ok");
+  }
+
   // ---------- Flashdisk ----------
 
   function renderDiag(r) {
@@ -377,14 +604,49 @@
   async function loadDisks() {
     try {
       const data = await api("/api/disks");
-      state.disks = data.disks;
+      state.disks = data.disks || [];
+      state.stuck = new Set(state.disks.filter((d) => d.stuck === true).map((d) => normPath(d.path)));
       ["fs-disk", "carve-disk", "image-disk", "flash-disk"].forEach((id) => {
-        const sel = $(id);
-        sel.innerHTML = `<option value="">— pilih disk —</option>` + state.disks.map((d) =>
-          `<option value="${esc(d.path)}">${esc(d.desc)}</option>`).join("");
-        sel.onchange = () => { const target = { "fs-disk": "fs-src", "carve-disk": "carve-src", "image-disk": "image-src", "flash-disk": "flash-src" }[id]; $(target).value = sel.value; };
+        const sel = $(id), prev = sel.value;
+        sel.innerHTML = `<option value="">— pilih disk —</option>` + state.disks.map((d) => d.stuck === true
+          ? `<option value="${esc(d.path)}" class="opt-stuck" title="${esc(STUCK_TIP)}">⚠ ${esc(d.desc)} — tidak merespons</option>`
+          : `<option value="${esc(d.path)}">${esc(d.desc)}</option>`).join("");
+        if (state.disks.some((d) => d.path === prev)) sel.value = prev;
+        sel.onchange = () => { const target = { "fs-disk": "fs-src", "carve-disk": "carve-src", "image-disk": "image-src", "flash-disk": "flash-src" }[id]; $(target).value = sel.value; refreshStuck(); };
       });
     } catch (err) { toast("Daftar disk tidak tersedia", err.message, "err"); }
+    refreshStuck();
+  }
+  function normPath(p) { return String(p || "").trim().toLowerCase(); }
+
+  // Disable operation buttons when the chosen source is a device that stopped responding.
+  function refreshStuck() {
+    Object.entries(STUCK_TARGETS).forEach(([key, t]) => {
+      const stuck = state.stuck.has(normPath($(t.src).value));
+      const note = document.querySelector(`[data-stuck-note="${key}"]`);
+      if (note) {
+        note.hidden = !stuck;
+        if (stuck && !note.childElementCount) {
+          note.innerHTML = `<span class="tag warn" title="${esc(STUCK_TIP)}">tidak merespons</span>
+            <span>Cabut lalu colok kembali drive ini.</span>
+            <button type="button" class="btn btn-sm btn-ghost" data-reload-disks>Muat ulang daftar disk</button>`;
+          note.querySelector("[data-reload-disks]").onclick = () => loadDisks();
+        }
+      }
+      t.buttons.forEach((bid) => {
+        const b = $(bid);
+        if (!b) return;
+        if (stuck) {
+          if (!b.dataset.stuck) { b.dataset.stuck = "1"; b.dataset.prevTitle = b.title || ""; }
+          b.disabled = true;
+          b.title = STUCK_TIP;
+        } else if (b.dataset.stuck) {
+          b.disabled = false;
+          b.title = b.dataset.prevTitle || "";
+          delete b.dataset.stuck; delete b.dataset.prevTitle;
+        }
+      });
+    });
   }
 
   // ---------- events ----------
@@ -424,12 +686,13 @@
       state.fsSel.clear();
       startJob("/api/fs/scan", { source, ...dateRange("fs-from", "fs-to") }, "fs_scan");
     };
-    $("fs-match").oninput = () => loadFs();
     $("fs-from").onchange = loadFs;
     $("fs-to").onchange = loadFs;
     $("fs-select-all").onclick = () => {
-      const ids = state.fs.map((e) => e.id);
-      state.fsSel = state.fsSel.size === ids.length ? new Set() : new Set(ids);
+      // selects (or clears) the rows the current filter shows
+      const ids = (state.fsShown || state.fs).map((e) => e.id);
+      const allOn = ids.length > 0 && ids.every((id) => state.fsSel.has(id));
+      ids.forEach((id) => allOn ? state.fsSel.delete(id) : state.fsSel.add(id));
       renderFs();
     };
     $("fs-preview").onclick = () => {
@@ -484,6 +747,35 @@
       ok.onchange = () => go.disabled = !ok.checked;
       go.onclick = () => { m.close(); startJob("/api/flash/repair", { device: dev(), mode: "fix" }, "flash_repair"); };
     };
+
+    // capacity test
+    $("cap-size").onchange = () => {
+      const custom = $("cap-size").value === "custom";
+      $("cap-custom-wrap").hidden = !custom;
+      if (custom) $("cap-custom").focus();
+    };
+    $("cap-start").onclick = () => {
+      if (state.job) return toast("Pekerjaan lain berjalan", "Tunggu sampai selesai atau batalkan dulu.", "err");
+      const path = $("cap-path").value.trim();
+      if (!path) return toast("Pilih drive atau folder", "Isi lokasi drive atau folder yang akan diuji.", "err");
+      const sizeMb = capacitySizeMb();
+      if (!sizeMb) return toast("Ukuran tidak valid", "Isi ukuran uji dalam MB (bilangan bulat minimal 1).", "err");
+      $("cap-result").className = "muted small";
+      $("cap-result").textContent = `Menguji ${sizeMb.toLocaleString("id-ID")} MB di ${path}…`;
+      startJob("/api/capacity", { path, size_mb: sizeMb }, "capacity").then((ok) => {
+        if (!ok) $("cap-result").textContent = "Uji tidak dimulai.";
+      });
+    };
+
+    // stuck devices: re-check when a source path is typed or picked
+    Object.values(STUCK_TARGETS).forEach((t) => {
+      $(t.src).addEventListener("input", refreshStuck);
+      $(t.src).addEventListener("change", refreshStuck);
+    });
+
+    // result filters
+    state.filters.fs = makeFilter("fs", renderFs);
+    state.filters.carve = makeFilter("carve", renderCarve);
 
     // repair
     $("repair-start").onclick = () => {
@@ -608,7 +900,7 @@
     // resume a running job after reload
     try {
       const job = await api("/api/job");
-      if (job.state === "running") { state.job = { name: job.name }; poll(); }
+      if (job.state === "running") { state.job = { name: job.name }; syncRunning(); poll(); }
     } catch (_) { /* ignore */ }
   }
 

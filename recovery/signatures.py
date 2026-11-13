@@ -9,6 +9,11 @@ Each signature describes:
   scan_start  - function(head_bytes) -> offset where footer search may start (JPEG: after SOS)
   max_size    - upper bound used when no footer is found
   check       - optional validation of the first bytes (called with 4096 bytes)
+  walk        - optional structure walker (see formats.py): walk(read, avail) -> None
+                (reject) or (end, complete). When set, the walked end decides the
+                file size instead of footer / next-file / max_size.
+  align       - only accept headers whose file start is a multiple of this (0 = any);
+                used for weak magics (bare MP3 frame sync) since files start on sectors
 """
 
 from __future__ import annotations
@@ -16,7 +21,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from .formats import jpeg_scan_start
+from .formats import (
+    MOV_BRANDS,
+    id3v2_size,
+    jpeg_header_ok,
+    jpeg_scan_start,
+    mp3_frames_ok,
+    mp3_walk,
+    mp4_ftyp_brand,
+    mp4_walk,
+)
 
 
 @dataclass(frozen=True)
@@ -31,6 +45,8 @@ class Signature:
     footer_extra: int = 0
     footer_last: bool = False
     scan_start: Optional[Callable[[bytes], Optional[int]]] = None
+    walk: Optional[Callable[[Callable[[int, int], bytes], int], Optional[tuple[int, bool]]]] = None
+    align: int = 0
 
 
 MB = 1024 * 1024
@@ -53,8 +69,43 @@ def _gzip(head: bytes) -> bool:
 
 
 def _mp3_id3(head: bytes) -> bool:
-    """ID3v2 header: major version 2-4 and revision 0."""
-    return len(head) >= 6 and head[3] in (2, 3, 4) and head[4] == 0
+    """ID3v2 header: major version 2-4, revision 0 and a syncsafe size.
+
+    If the tag ends inside `head`, the first audio frame after it (allowing some
+    zero padding) must carry a valid frame sync too.
+    """
+    if not (len(head) >= 6 and head[3] in (2, 3, 4) and head[4] == 0):
+        return False
+    tag = id3v2_size(head)
+    if tag is None:
+        return False
+    if tag + 4 > len(head):
+        return True  # large tag (cover art): the walker checks the frames
+    rel = tag
+    while rel + 4 <= len(head) and head[rel] == 0:
+        rel += 1
+    if rel + 4 > len(head):
+        return True
+    return mp3_frames_ok(head, rel, need=2)
+
+
+def _mp3_frame(head: bytes) -> bool:
+    """No ID3 tag: the first audio frame must have the 11-bit sync and a valid
+    Layer III header, followed by consistent frames."""
+    return mp3_frames_ok(head, 0, need=3)
+
+
+def _jpeg(head: bytes) -> bool:
+    return jpeg_header_ok(head)
+
+
+def _mp4(head: bytes) -> bool:
+    brand = mp4_ftyp_brand(head)
+    return brand is not None and brand not in MOV_BRANDS
+
+
+def _mov(head: bytes) -> bool:
+    return mp4_ftyp_brand(head) in MOV_BRANDS
 
 
 def _pe(head: bytes) -> bool:
@@ -68,8 +119,9 @@ def _pe(head: bytes) -> bool:
 
 
 SIGNATURES: list[Signature] = [
-    Signature("jpeg", "jpg", b"\xff\xd8\xff\xe0", b"\xff\xd9", 30 * MB, scan_start=jpeg_scan_start),
-    Signature("jpeg", "jpg", b"\xff\xd8\xff\xe1", b"\xff\xd9", 30 * MB, scan_start=jpeg_scan_start),
+    # SOI + marker; _jpeg validates the marker after SOI (APPn/DQT/DHT/SOFn/DRI/COM)
+    # and the segment chain, so an embedded EXIF thumbnail SOI is also accepted only if valid.
+    Signature("jpeg", "jpg", b"\xff\xd8\xff", b"\xff\xd9", 30 * MB, check=_jpeg, scan_start=jpeg_scan_start),
     Signature("png", "png", b"\x89PNG\r\n\x1a\n", b"IEND\xaeB`\x82", 30 * MB),
     Signature("gif", "gif", b"GIF87a", b"\x00\x3b", 20 * MB),
     Signature("gif", "gif", b"GIF89a", b"\x00\x3b", 20 * MB),
@@ -80,10 +132,17 @@ SIGNATURES: list[Signature] = [
     Signature("7z", "7z", b"7z\xbc\xaf\x27\x1c", None, 2000 * MB),
     Signature("gzip", "gz", b"\x1f\x8b\x08", None, 2000 * MB, check=_gzip),
     Signature("sqlite", "sqlite", b"SQLite format 3\x00", None, 2000 * MB),
-    Signature("mp4", "mp4", b"ftyp", None, 4000 * MB, offset=4),
+    # ISO-BMFF: "ftyp" at offset 4 alone matches random data; the check validates the
+    # ftyp box + brand and the walker follows top-level boxes to find the real end.
+    Signature("mp4", "mp4", b"ftyp", None, 4000 * MB, offset=4, check=_mp4, walk=mp4_walk),
+    Signature("mov", "mov", b"ftyp", None, 4000 * MB, offset=4, check=_mov, walk=mp4_walk),
     Signature("avi", "avi", b"RIFF", None, 4000 * MB, check=_riff_avi),
     Signature("wav", "wav", b"RIFF", None, 1000 * MB, check=_riff_wav),
-    Signature("mp3", "mp3", b"ID3", None, 50 * MB, check=_mp3_id3),
+    Signature("mp3", "mp3", b"ID3", None, 50 * MB, check=_mp3_id3, walk=mp3_walk),
+    # MP3 without an ID3 tag: Layer III frame sync (MPEG-1, 2, 2.5; with/without CRC).
+    # Two-byte magic is weak, so only sector-aligned starts are considered.
+    *[Signature("mp3", "mp3", magic, None, 50 * MB, check=_mp3_frame, walk=mp3_walk, align=512)
+      for magic in (b"\xff\xfb", b"\xff\xfa", b"\xff\xf3", b"\xff\xf2", b"\xff\xe3", b"\xff\xe2")],
     Signature("exe", "exe", b"MZ", None, 200 * MB, check=_pe),
 ]
 

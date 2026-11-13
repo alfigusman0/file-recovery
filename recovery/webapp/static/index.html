@@ -85,6 +85,7 @@
             <div class="field"><label>Sumber (disk / image)</label>
               <div class="input-group"><select id="fs-disk"></select><button class="btn" data-browse="fs-src" data-mode="file">Pilih file</button></div>
               <input type="text" id="fs-src" placeholder="contoh: \\.\C: atau D:\disk.img" style="margin-top:6px">
+              <div class="stuck-note" data-stuck-note="fs" hidden></div>
             </div>
             <div class="field" style="flex:0 0 auto"><label>Dihapus dari</label><input type="date" id="fs-from"></div>
             <div class="field" style="flex:0 0 auto"><label>Sampai</label><input type="date" id="fs-to"></div>
@@ -99,8 +100,8 @@
               <div class="stat"><div class="label">Dipilih</div><div class="value" id="fs-selected">0</div></div>
             </div>
           </div>
+          <div class="filters" id="fs-filters"></div>
           <div class="toolbar">
-            <input type="search" id="fs-match" placeholder="Cari nama atau path..." style="max-width:320px">
             <button class="btn btn-sm" id="fs-select-all">Pilih semua</button>
             <button class="btn btn-sm" id="fs-preview" disabled>Pratinjau</button>
             <span class="spacer"></span>
@@ -109,9 +110,10 @@
             <button class="btn btn-primary" id="fs-recover" disabled>Pulihkan yang dipilih</button>
           </div>
           <div class="table-wrap">
-            <table><thead><tr><th style="width:36px"></th><th>Path file</th><th class="num">Ukuran</th><th>Sistem file</th><th>Dihapus (perkiraan)</th></tr></thead>
+            <table><thead><tr><th style="width:36px"></th><th>Path file</th><th class="num">Ukuran</th><th>Sistem file</th><th class="fs-status-col" hidden>Status</th><th>Dihapus (perkiraan)</th></tr></thead>
             <tbody id="fs-body"></tbody></table>
           </div>
+          <div class="muted small" id="fs-limit" style="margin-top:8px" hidden></div>
         </div>
       </div>
     </section>
@@ -125,6 +127,7 @@
             <div class="field"><label>Sumber (disk / image)</label>
               <div class="input-group"><select id="carve-disk"></select><button class="btn" data-browse="carve-src" data-mode="file">Pilih file</button></div>
               <input type="text" id="carve-src" placeholder="contoh: \\.\E: atau D:\disk.img" style="margin-top:6px">
+              <div class="stuck-note" data-stuck-note="carve" hidden></div>
             </div>
             <div class="field"><label>Simpan hasil ke</label>
               <div class="input-group"><input type="text" id="carve-out"><button class="btn" data-browse="carve-out" data-mode="dir">Pilih folder</button></div>
@@ -152,6 +155,23 @@
           </div>
           <div class="muted small" id="carve-result">Belum ada hasil.</div>
         </div>
+        <div class="card col-12" id="carve-files-card" hidden>
+          <div class="card-head"><h3 style="margin:0">File hasil carving</h3></div>
+          <div class="filters" id="carve-filters"></div>
+          <div class="table-wrap">
+            <table><thead><tr><th>File</th><th>Jenis</th><th class="num">Ukuran</th><th>Status</th><th class="carve-conf-col">Keyakinan</th></tr></thead>
+            <tbody id="carve-body"></tbody></table>
+          </div>
+          <div class="muted small" id="carve-limit" style="margin-top:8px" hidden></div>
+          <details class="legend carve-conf-col">
+            <summary>Arti tingkat keyakinan</summary>
+            <ul>
+              <li><span class="tag ok">Tinggi</span> Struktur file lengkap dan cocok dari awal sampai akhir. Kemungkinan besar file bisa dibuka normal.</li>
+              <li><span class="tag warn">Sedang</span> Awal file dan sebagian strukturnya cocok, tetapi ada bagian yang tidak bisa dipastikan. File mungkin terbuka dengan sedikit kerusakan.</li>
+              <li><span class="tag bad">Rendah</span> Hanya tanda awal file yang cocok. Isinya bisa terpotong atau tercampur data lain.</li>
+            </ul>
+          </details>
+        </div>
       </div>
     </section>
 
@@ -164,6 +184,7 @@
             <div class="field"><label>Disk / partisi yang disalin</label>
               <div class="input-group"><select id="image-disk"></select><button class="btn" data-browse="image-src" data-mode="file">Pilih file</button></div>
               <input type="text" id="image-src" style="margin-top:6px">
+              <div class="stuck-note" data-stuck-note="image" hidden></div>
             </div>
             <div class="field"><label>File image tujuan</label>
               <div class="input-group"><input type="text" id="image-out"><button class="btn" data-browse="image-out" data-mode="save">Simpan ke</button></div>
@@ -184,6 +205,7 @@
             <div class="field"><label>Perangkat</label>
               <div class="input-group"><select id="flash-disk"></select><button class="btn" data-browse="flash-src" data-mode="file">File image</button></div>
               <input type="text" id="flash-src" style="margin-top:6px">
+              <div class="stuck-note" data-stuck-note="flash" hidden></div>
             </div>
           </div>
         </div>
@@ -204,6 +226,28 @@
           <h3>5. Perbaiki sistem file <span class="tag bad">menulis</span></h3>
           <p class="muted small">Menulis ke perangkat. Salin ke image dulu. Perangkat sistem tidak akan diperbaiki.</p>
           <button class="btn btn-danger" id="flash-fix">Perbaiki…</button>
+        </div>
+        <div class="card col-12" id="cap-card">
+          <h3>Uji kapasitas <span class="tag warn">menulis file uji</span></h3>
+          <p class="muted small">Mendeteksi flashdisk palsu: menulis data uji ke drive atau folder, lalu membacanya kembali dan memeriksa isinya. Pastikan ruang kosong cukup. File yang sudah ada tidak diubah.</p>
+          <div class="row">
+            <div class="field"><label for="cap-path">Drive atau folder</label>
+              <div class="input-group"><input type="text" id="cap-path" placeholder="contoh: E:\ atau /media/usb"><button class="btn" data-browse="cap-path" data-mode="dir">Pilih folder</button></div>
+            </div>
+            <div class="field" style="flex:0 1 170px"><label for="cap-size">Ukuran uji</label>
+              <select id="cap-size">
+                <option value="512">512 MB</option>
+                <option value="2048" selected>2 GB</option>
+                <option value="8192">8 GB</option>
+                <option value="custom">Lainnya (MB)…</option>
+              </select>
+            </div>
+            <div class="field" style="flex:0 1 150px" id="cap-custom-wrap" hidden><label for="cap-custom">Ukuran (MB)</label>
+              <input type="number" id="cap-custom" min="1" step="1" inputmode="numeric" placeholder="mis. 1024">
+            </div>
+            <div class="field" style="flex:0 0 auto"><label>&nbsp;</label><button class="btn btn-primary" id="cap-start">Mulai uji kapasitas</button></div>
+          </div>
+          <div id="cap-result" class="muted small" style="margin-top:14px">Belum ada hasil.</div>
         </div>
         <div class="card col-12">
           <h3>Hasil</h3>

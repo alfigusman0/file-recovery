@@ -8,6 +8,7 @@ Examples:
   python -m recovery carve --source /dev/sdb --out ./carved          (Linux/macOS, run as root)
   python -m recovery carve --source \\\\.\\E: --out .\\carved          (Windows, run as Administrator)
   python -m recovery repair --path ./carved --out ./repaired
+  python -m recovery capacity E:\\ --mb 2048                           (fake-capacity test)
 """
 
 from __future__ import annotations
@@ -151,9 +152,41 @@ def cmd_gui(_args) -> int:
 
 
 def cmd_disks(_args) -> int:
-    for path, desc in list_disks():
+    for path, desc in list_disks():  # desc ends with "[tidak merespons]" for a stuck device
         print(f"{path:<24} {desc}")
     return 0
+
+
+def cmd_capacity(args) -> int:
+    from .flashcheck import CapacityRefused, capacity_test
+
+    print(f"PERINGATAN: uji ini mengisi ruang kosong di {args.folder} dengan data uji "
+          "(folder capacity_test, dihapus lagi di akhir). Salin data penting dulu.", file=sys.stderr)
+
+    def progress(phase: str, done: int, total: int) -> None:
+        label = "menulis" if phase == "write" else "verifikasi"
+        pct = f"{done * 100 // total:3d}%" if total else "    "
+        print(f"\r{label}: {pct} ({done // (1024 * 1024)} MB)   ", end="", file=sys.stderr, flush=True)
+
+    try:
+        result = capacity_test(args.folder, args.mb, progress=progress, file_mb=args.file_mb)
+    except CapacityRefused as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 1
+    except (ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(file=sys.stderr)
+    mb = 1024 * 1024
+    print(f"ditulis:       {result.bytes_written // mb} MB ({result.write_mb_per_s} MB/s)")
+    print(f"terverifikasi: {result.bytes_verified_ok // mb} MB ({result.read_mb_per_s} MB/s)")
+    print(f"blok berbeda:  {result.mismatched_blocks}, tidak terbaca: {result.unreadable_blocks}")
+    if result.first_bad_offset is not None:
+        print(f"rusak mulai:   offset {result.first_bad_offset} ({result.first_bad_offset // mb} MB)")
+    print(result.verdict)
+    if result.cancelled:
+        return 130
+    return 0 if result.ok else 2
 
 
 def cmd_scan_deleted(args) -> int:
@@ -276,6 +309,12 @@ def build_parser() -> argparse.ArgumentParser:
     im.add_argument("--source", required=True)
     im.add_argument("--out", required=True, help="image file to create, e.g. ./disk.img")
     im.set_defaults(func=cmd_image)
+
+    cap = sub.add_parser("capacity", help="fake-capacity test: write test data to free space, read it back")
+    cap.add_argument("folder", help="folder on the flash drive, e.g. E:\\ (not the system drive)")
+    cap.add_argument("--mb", type=int, default=0, help="MB to test (default 0 = all free space)")
+    cap.add_argument("--file-mb", type=positive_int, default=1024, help="size of each test file in MB")
+    cap.set_defaults(func=cmd_capacity)
 
     r = sub.add_parser("repair", help="repair damaged files (file or folder)")
     r.add_argument("--path", required=True)

@@ -1,3 +1,7 @@
-pytsk3>=4.15
-# Optional, for building a standalone app:
-# pyinstaller>=6.0
+# Third-party packages imported by recovery/ (everything else is the Python standard library).
+# pytsk3: optional at runtime (deleted-file scan with original names, file-system diagnosis).
+# 20260520 is the first release with binary wheels for Python 3.12/3.13 on Windows, macOS and Linux.
+pytsk3>=20260520
+
+# Optional, only for building a standalone app with build_app.py:
+# pyinstaller>=6.10

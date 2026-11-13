@@ -28,7 +28,9 @@ from urllib.parse import parse_qs, unquote, urlparse
 from .. import __version__
 from ..carver import carve_summary, source_size
 from ..dates import make_range
-from ..disks import list_disks
+from ..disks import list_disks_info
+from ..flashcheck import (PROBE_TIMEOUT, STUCK, DeviceNotResponding, capacity_test, check_capacity_target,
+                          device_key, run_with_timeout)
 from ..flashrepair import diagnose, repair_command, run_repair, surface_scan
 from ..fsmeta import recover_entries, scan_deleted
 from ..imaging import export_entries, image_source
@@ -247,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"version": __version__, "os": current_os(), "admin": is_admin(),
                                     "log": app.log_path})
         if path == "/api/disks":
-            return self._json(200, {"disks": [{"path": p, "desc": d} for p, d in list_disks()]})
+            return self._json(200, list_disks_info())
         if path == "/api/browse":
             return self._json(200, browse(q.get("path", "")))
         if path == "/api/job":
@@ -318,6 +320,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._api_post(path, body)
         except JobBusy as exc:
             return self._error(HTTPStatus.CONFLICT, str(exc))
+        except DeviceNotResponding as exc:
+            retry = max(1, int(STUCK.remaining(exc.key)) + 1) if exc.key else 30
+            return self._send(HTTPStatus.SERVICE_UNAVAILABLE, _json_dump({"error": str(exc), "stuck": True}),
+                              headers={"Retry-After": str(retry)})
         except UnsafeDestinationError as exc:
             return self._error(HTTPStatus.FORBIDDEN, str(exc))
         except (ValueError, FileNotFoundError, KeyError) as exc:
@@ -333,6 +339,12 @@ class Handler(BaseHTTPRequestHandler):
         if not value:
             raise ValueError(f"'{key}' wajib diisi")
         return value
+
+    @staticmethod
+    def _not_stuck(device: str, whole_drive: bool = False) -> None:
+        key = device_key(device, whole_drive=whole_drive)
+        if STUCK.is_stuck(key):
+            raise DeviceNotResponding(STUCK.message(key), key)
 
     def _api_post(self, path: str, body: dict) -> None:
         app = self.app
@@ -522,6 +534,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/flash/diagnose":
             dev = self._need(body, "device")
+            self._not_stuck(dev)
 
             def run(job):
                 job.set_phase("Membaca sektor awal")
@@ -533,11 +546,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/flash/surface":
             dev = self._need(body, "device")
+            self._not_stuck(dev)
 
             def run(job):
                 def track(done, total):
                     job.progress(done, total)
                 res = surface_scan(dev, progress=track, cancel=job.cancel_event)
+                if res.stuck:
+                    job.set_phase("Perangkat tidak merespons", res.message)
                 out = asdict(res)
                 out["healthy"] = res.healthy
                 out["bad_bytes"] = res.bad_bytes
@@ -559,6 +575,42 @@ class Handler(BaseHTTPRequestHandler):
                 return {"code": code, "output": output, "command": " ".join(cmd)}
 
             job = jobs.start("flash_repair", "Perbaikan sistem file", run)
+            return self._json(202, {"started": job.name})
+
+        if path == "/api/capacity":
+            target = self._need(body, "path")
+            try:
+                size_mb = int(body.get("size_mb", 0) or 0)
+                file_mb = int(body.get("file_mb", 1024) or 1024)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("'size_mb' dan 'file_mb' harus angka") from exc
+            if size_mb < 0 or not 1 <= file_mb <= 4096:
+                raise ValueError("'size_mb' minimal 0 (0 = semua ruang kosong), 'file_mb' 1..4096")
+            key = device_key(target, whole_drive=True)
+            self._not_stuck(target, whole_drive=True)
+            # The folder check touches the device, so it is guarded like any other probe.
+            probe = run_with_timeout(check_capacity_target, target, timeout=PROBE_TIMEOUT, key=key)
+            if probe.timed_out:
+                raise DeviceNotResponding(probe.message, key)
+            if not probe.ok:
+                raise probe.exception  # CapacityRefused is a ValueError -> 400
+            folder = probe.value
+
+            def run(job):
+                stage = {"name": None}
+
+                def track(phase, done, total):
+                    if phase != stage["name"]:
+                        stage["name"] = phase
+                        job.new_stage("Menulis data uji" if phase == "write" else "Memverifikasi data",
+                                      total, folder)
+                    job.progress(done, total)
+
+                job.set_phase("Menyiapkan", folder)
+                res = capacity_test(folder, size_mb, cancel=job.cancel_event, progress=track, file_mb=file_mb)
+                return asdict(res)
+
+            job = jobs.start("capacity", "Uji kapasitas", run, unit="bytes")
             return self._json(202, {"started": job.name})
 
         return self._error(HTTPStatus.NOT_FOUND, "endpoint tidak ada")

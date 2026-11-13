@@ -1,0 +1,90 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.12", "3.13"]
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        # bash exists on all three runners; GitHub runs it with -e -o pipefail.
+        shell: bash
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      # Every requirement except pytsk3 must install. A failure here fails the job.
+      - name: Install requirements.txt (everything except pytsk3, strict)
+        run: |
+          grep -v -i -E '^[[:space:]]*pytsk3' requirements.txt > "$RUNNER_TEMP/requirements-no-tsk.txt" || true
+          if grep -q -E '^[[:space:]]*[A-Za-z0-9]' "$RUNNER_TEMP/requirements-no-tsk.txt"; then
+            python -m pip install -r "$RUNNER_TEMP/requirements-no-tsk.txt"
+          else
+            echo "No requirements besides pytsk3."
+          fi
+
+      # pytsk3 is optional for the app: tests that need it skip themselves when it is missing.
+      # Try the binary wheel first, then a source build. If both fail, the job continues
+      # with a visible warning annotation instead of silently passing.
+      - name: Install pytsk3 (optional; wheel, then source build, else warn and continue)
+        id: tsk
+        run: |
+          spec="$(grep -i -E '^[[:space:]]*pytsk3' requirements.txt | head -n 1 | tr -d '[:space:]' || true)"
+          spec="${spec:-pytsk3}"
+          echo "Requirement: $spec"
+          if python -m pip install --only-binary=pytsk3 "$spec"; then
+            echo "status=wheel" >> "$GITHUB_OUTPUT"
+          elif python -m pip install --no-binary=pytsk3 "$spec"; then
+            echo "status=source" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning title=pytsk3 not installed::pytsk3 could not be installed on ${{ matrix.os }} / Python ${{ matrix.python-version }}. Tests that need it will be skipped."
+            echo "status=missing" >> "$GITHUB_OUTPUT"
+          fi
+
+      # If pip said pytsk3 installed, it must also import. A broken install is a real failure.
+      - name: Verify pytsk3 import (fails if installed but broken)
+        if: steps.tsk.outputs.status != 'missing'
+        run: python -c "import pytsk3; print('pytsk3', pytsk3.get_version())"
+
+      - name: Record pytsk3 status in the job summary
+        if: always()
+        run: |
+          echo "pytsk3 on ${{ matrix.os }} / Python ${{ matrix.python-version }}: ${{ steps.tsk.outputs.status || 'unknown' }}" >> "$GITHUB_STEP_SUMMARY"
+
+      # Some tests are Windows- or Linux-specific and skip themselves elsewhere.
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v 2>&1 | tee test-output.txt
+
+      - name: Upload test output (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: test-output.txt
+          if-no-files-found: warn
+          retention-days: 14

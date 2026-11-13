@@ -37,6 +37,15 @@ class RecoveredFile:
     source_offset: int
     size: int
     complete: bool  # True when a footer was found (or the format has none)
+    # "high": complete and confirmed by a format validator (header check / structure walk)
+    # "medium": footer found, but no deep validation of the content
+    # "low": end is a guess (no footer, truncated at max_size / next file) or incomplete
+    confidence: str = "low"
+
+
+CONFIDENCE_HIGH = "high"
+CONFIDENCE_MEDIUM = "medium"
+CONFIDENCE_LOW = "low"
 
 
 @dataclass
@@ -87,6 +96,9 @@ def _find_headers(buf: bytes, base: int, sigs: Iterable[Signature], seen: set[tu
         while idx != -1:
             file_start = base + idx - sig.offset
             key = (sig.name + sig.extension, file_start)
+            if sig.align and file_start % sig.align:
+                idx = buf.find(sig.header, idx + 1)
+                continue
             if file_start >= 0 and key not in seen:
                 seen.add(key)
                 yield sig, file_start
@@ -129,6 +141,67 @@ def find_candidates(
     return results
 
 
+class _CachedReader:
+    """read(rel_offset, n) relative to `base`, bounded by `avail`, with a small read-ahead cache."""
+
+    BLOCK = 256 * 1024
+
+    def __init__(self, f: BinaryIO, base: int, avail: int,
+                 cancel: Optional[threading.Event] = None) -> None:
+        self.f, self.base, self.avail, self.cancel = f, base, avail, cancel
+        self._pos = 0
+        self._buf = b""
+
+    def __call__(self, off: int, n: int) -> bytes:
+        if off < 0 or n <= 0 or off >= self.avail:
+            return b""
+        n = min(n, self.avail - off)
+        if self._pos <= off and off + n <= self._pos + len(self._buf):
+            rel = off - self._pos
+            return self._buf[rel:rel + n]
+        _check_cancel(self.cancel)
+        self._pos = off
+        self._buf = read_at(self.f, self.base + off, min(max(n, self.BLOCK), self.avail - off))
+        return self._buf[:n]
+
+
+def _copy_range(f: BinaryIO, start: int, length: int, out_path: str,
+                cancel: Optional[threading.Event]) -> int:
+    written = 0
+    with open(out_path, "wb") as out:
+        while written < length:
+            _check_cancel(cancel)
+            block = read_at(f, start + written, min(EXTRACT_BLOCK, length - written))
+            if not block:
+                break
+            out.write(block)
+            written += len(block)
+    return written
+
+
+def _extract_walked(
+    f: BinaryIO, sig: Signature, start: int, out_path: str, end_limit: int,
+    cancel: Optional[threading.Event],
+) -> tuple[int, bool, str]:
+    """Extract using the signature's structure walker: the file ends where the walk ends."""
+    assert sig.walk is not None
+    avail = max(0, end_limit - start)
+    result = sig.walk(_CachedReader(f, start, avail, cancel), avail)
+    if result is None:
+        return 0, False, CONFIDENCE_LOW
+    end_rel, complete = result
+    end_rel = min(end_rel, avail)
+    if end_rel <= 0 or (not complete and end_rel < MIN_FILE_SIZE):
+        return 0, False, CONFIDENCE_LOW
+    written = _copy_range(f, start, end_rel, out_path, cancel)
+    if written < end_rel:  # source ended early
+        complete = False
+    if written == 0 or (not complete and written < MIN_FILE_SIZE):
+        os.remove(out_path)
+        return 0, False, CONFIDENCE_LOW
+    return written, complete, CONFIDENCE_HIGH if complete else CONFIDENCE_LOW
+
+
 def extract_one(
     f: BinaryIO,
     sig: Signature,
@@ -143,6 +216,28 @@ def extract_one(
     limit: absolute offset where this file must stop (start of the next file of
     the same type). Footers found beyond it are ignored.
     """
+    size, complete, _ = extract_file(f, sig, start, out_path, total, limit, cancel)
+    return size, complete
+
+
+def extract_file(
+    f: BinaryIO,
+    sig: Signature,
+    start: int,
+    out_path: str,
+    total: int,
+    limit: Optional[int] = None,
+    cancel: Optional[threading.Event] = None,
+) -> tuple[int, bool, str]:
+    """Like extract_one, but also returns the confidence ("high" / "medium" / "low")."""
+    if sig.walk is not None:
+        end_limit = start + sig.max_size
+        if limit is not None:
+            end_limit = min(end_limit, limit)
+        if total:
+            end_limit = min(end_limit, total)
+        return _extract_walked(f, sig, start, out_path, end_limit, cancel)
+
     footer = sig.footer
     extra = sig.footer_extra
     keep = len(footer) - 1 if footer else 0
@@ -233,10 +328,14 @@ def extract_one(
 
     if written == 0 or (not complete and written < MIN_FILE_SIZE):
         os.remove(out_path)
-        return 0, False
+        return 0, False, CONFIDENCE_LOW
     if not footer:
-        complete = True  # no footer defined; accept what was read
-    return written, complete
+        # No footer defined; accept what was read. The end is only a guess
+        # (next file of the same type, end of source or max_size).
+        return written, True, CONFIDENCE_LOW
+    if not complete:
+        return written, False, CONFIDENCE_LOW
+    return written, True, CONFIDENCE_HIGH if sig.check is not None else CONFIDENCE_MEDIUM
 
 
 def carve(
@@ -303,8 +402,10 @@ def carve_summary(
                     continue
                 # Only formats without a self-terminating footer need the next-file bound.
                 # (A ZIP's local headers are all candidates; its EOCD ends it, so it must not be cut.)
+                # Structure-walked formats find their own end (a false header inside
+                # e.g. an MP4 mdat must not cut the real file short).
                 limit = None
-                if sig.footer is None or sig.footer_last:
+                if sig.walk is None and (sig.footer is None or sig.footer_last):
                     starts = by_name[sig.name]
                     nxt = bisect.bisect_right(starts, start)
                     limit = starts[nxt] if nxt < len(starts) else None
@@ -320,9 +421,10 @@ def carve_summary(
                 counters[sig.extension] = counters.get(sig.extension, 0) + 1
                 name = f"{sig.name}_{counters[sig.extension]:05d}_{start:x}.{sig.extension}"
                 out_path = os.path.join(out_dir, name)
-                size, complete = extract_one(f, sig, start, out_path, total, limit=limit, cancel=cancel)
+                size, complete, confidence = extract_file(
+                    f, sig, start, out_path, total, limit=limit, cancel=cancel)
                 if size:
-                    recovered.append(RecoveredFile(out_path, sig.name, start, size, complete))
+                    recovered.append(RecoveredFile(out_path, sig.name, start, size, complete, confidence))
                     covered_until = start + size
         except CancelledError:
             cancelled = True
