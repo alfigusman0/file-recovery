@@ -18,9 +18,10 @@ class JobBusy(RuntimeError):
 
 
 class Job:
-    def __init__(self, name: str, label: str, unit: str = "bytes"):
+    def __init__(self, name: str, label: str, unit: str = "bytes", cancellable: bool = True):
         self.name = name
         self.label = label
+        self.cancellable = cancellable  # False for steps that write to a device and must finish
         self.state = "running"          # running | done | error | cancelled
         self.phase = "Memulai"
         self.text = ""
@@ -107,7 +108,8 @@ class JobManager:
         self.current: Optional[Job] = None
         self.last: Optional[Job] = None
 
-    def start(self, name: str, label: str, fn: Callable[[Job], Any], unit: str = "bytes") -> Job:
+    def start(self, name: str, label: str, fn: Callable[[Job], Any], unit: str = "bytes",
+              cancellable: bool = True) -> Job:
         with self._lock:
             cur = self.current
             if cur is not None and cur.state == "running":
@@ -123,7 +125,7 @@ class JobManager:
                 cur.finished = time.time()
                 self.last = cur
                 log.warning("job %s abandoned: still blocked %.0f s after cancel", cur.name, waited)
-            job = Job(name, label, unit)
+            job = Job(name, label, unit, cancellable)
             self.current = job
         log.info("job started: %s", name)
 
@@ -156,7 +158,7 @@ class JobManager:
 
     def cancel(self) -> bool:
         job = self.current
-        if job is None or job.state != "running":
+        if job is None or job.state != "running" or not job.cancellable:
             return False
         job.cancel_event.set()
         if job.cancel_requested_at is None:

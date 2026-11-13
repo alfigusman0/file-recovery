@@ -975,7 +975,11 @@
     });
 
     $("job-cancel").onclick = async () => {
-      try { await api("/api/job/cancel", { method: "POST", body: {} }); toast("Membatalkan…", "menunggu langkah berikutnya selesai"); }
+      try {
+        const r = await api("/api/job/cancel", { method: "POST", body: {} });
+        if (r.cancelled === false && r.message) toast("Tidak bisa dibatalkan", r.message, "err");
+        else toast("Membatalkan…", "menunggu langkah berikutnya selesai");
+      }
       catch (err) { toast("Gagal membatalkan", err.message, "err"); }
     };
 

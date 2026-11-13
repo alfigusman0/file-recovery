@@ -15,7 +15,6 @@ import json
 import os
 import secrets
 import shutil
-import string
 import sys
 import tempfile
 import threading
@@ -29,9 +28,9 @@ from .. import __version__
 from ..carver import carve_summary, source_size
 from ..dates import make_range
 from ..disks import list_disks_info
-from ..flashcheck import (PROBE_TIMEOUT, STUCK, DeviceNotResponding, capacity_test, check_capacity_target,
-                          device_key, run_with_timeout)
-from ..flashrepair import diagnose, repair_command, run_repair, surface_scan
+from ..flashcheck import (PROBE_TIMEOUT, READ_TIMEOUT, STUCK, DeviceNotResponding, capacity_test,
+                          check_capacity_target, device_key, run_with_timeout)
+from ..flashrepair import diagnose, is_read_only_check, repair_command, run_repair, surface_scan
 from ..fsmeta import recover_entries, scan_deleted
 from ..imaging import export_entries, image_source
 from ..logsetup import RING, get_logger, set_debug, setup_logging
@@ -92,13 +91,22 @@ def _trash_dict(i: int, item) -> dict:
     }
 
 
+def _windows_drive_letters() -> list[str]:
+    """Drive letters present on this PC, read from the OS bit mask: no disk is touched."""
+    import ctypes
+    try:
+        mask = ctypes.windll.kernel32.GetLogicalDrives()  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        return []
+    return [f"{chr(65 + i)}:" for i in range(26) if mask & (1 << i)]
+
+
 def list_roots() -> list[dict]:
     roots = []
     if current_os() == "windows":
-        for letter in string.ascii_uppercase:
-            path = f"{letter}:\\"
-            if os.path.exists(path):
-                roots.append({"name": f"{letter}:", "path": path})
+        # Not os.path.exists per letter: that reads each drive, and one stuck flash drive would hang the list.
+        for letter in _windows_drive_letters():
+            roots.append({"name": letter, "path": letter + "\\"})
     else:
         roots.append({"name": "/", "path": "/"})
         home = os.path.expanduser("~")
@@ -106,11 +114,18 @@ def list_roots() -> list[dict]:
     return roots
 
 
-def browse(path: str) -> dict:
-    """Directory listing for the built-in file picker. Folders first, then files."""
-    if not path:
-        return {"path": "", "parent": None, "entries": [], "roots": list_roots()}
-    path = os.path.abspath(path)
+def guarded_exists(path: str) -> bool:
+    """os.path.exists with the device guard: a stuck drive raises DeviceNotResponding instead of hanging."""
+    if is_device_path(path):
+        return True
+    key = device_key(path, whole_drive=True)
+    res = run_with_timeout(os.path.exists, path, timeout=PROBE_TIMEOUT, key=key)
+    if res.timed_out:
+        raise DeviceNotResponding(res.message, key)
+    return bool(res.value) if res.ok else False
+
+
+def _list_dir(path: str) -> list[dict]:
     if not os.path.isdir(path):
         raise FileNotFoundError(f"Folder tidak ditemukan: {path}")
     entries = []
@@ -127,6 +142,25 @@ def browse(path: str) -> dict:
                     break
     except PermissionError as exc:
         raise PermissionError(f"Akses ditolak ke {path}: {exc}") from exc
+    return entries
+
+
+def browse(path: str) -> dict:
+    """Directory listing for the built-in file picker. Folders first, then files.
+
+    The read runs with the device guard: a drive that stops answering gives a
+    'tidak merespons' error after READ_TIMEOUT seconds instead of freezing the picker.
+    """
+    if not path:
+        return {"path": "", "parent": None, "entries": [], "roots": list_roots()}
+    path = os.path.abspath(path)
+    key = device_key(path, whole_drive=True)
+    res = run_with_timeout(_list_dir, path, timeout=READ_TIMEOUT, key=key)
+    if res.timed_out:
+        raise DeviceNotResponding(res.message, key)
+    if not res.ok:
+        raise res.exception  # type: ignore[misc]
+    entries = res.value
     entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
     parent = os.path.dirname(path)
     return {"path": path, "parent": parent if parent != path else None, "entries": entries,
@@ -221,6 +255,12 @@ class Handler(BaseHTTPRequestHandler):
             if not self._token_ok():
                 return self._error(HTTPStatus.FORBIDDEN, "Token tidak valid. Muat ulang halaman.")
             return self._api_get(url.path, query)
+        except DeviceNotResponding as exc:
+            retry = max(1, int(STUCK.remaining(exc.key)) + 1) if exc.key else 30
+            return self._send(HTTPStatus.SERVICE_UNAVAILABLE, _json_dump({"error": str(exc), "stuck": True}),
+                              headers={"Retry-After": str(retry)})
+        except UnsafeDestinationError as exc:
+            return self._error(HTTPStatus.FORBIDDEN, str(exc))
         except (ValueError, FileNotFoundError) as exc:
             return self._error(HTTPStatus.BAD_REQUEST, str(exc))
         except PermissionError as exc:
@@ -286,6 +326,8 @@ class Handler(BaseHTTPRequestHandler):
             fmt = q.get("format", "csv")
             name = "daftar-file-dihapus." + ("json" if fmt == "json" else "csv")
             out = os.path.join(app.preview_dir, name)
+            # The export is written to the temp folder: that must not be on the disk being scanned.
+            check_destination(app.fs_source, app.preview_dir)
             export_entries(app.fs_entries, out)
             with open(out, "rb") as fh:
                 body = fh.read()
@@ -367,6 +409,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True})
 
         if path == "/api/job/cancel":
+            cur = jobs.current
+            if cur is not None and cur.state == "running" and not cur.cancellable:
+                return self._json(200, {"cancelled": False,
+                                        "message": "Tugas ini sedang menulis ke perangkat dan tidak bisa "
+                                                   "dihentikan dengan aman. Tunggu sampai selesai."})
             return self._json(200, {"cancelled": jobs.cancel()})
 
         if path == "/api/trash/restore":
@@ -395,7 +442,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/fs/scan":
             source = self._need(body, "source")
-            if not is_device_path(source) and not os.path.exists(source):
+            if not guarded_exists(source):
                 raise FileNotFoundError(f"Sumber tidak ditemukan: {source}")
             date_range = make_range(body.get("from", ""), body.get("to", ""))
 
@@ -410,8 +457,11 @@ class Handler(BaseHTTPRequestHandler):
                 entries = scan_deleted(source, date_range=date_range, cancel=job.cancel_event,
                                        progress=lambda msg: job.set_phase("Membaca", msg),
                                        item_progress=item_cb)
-                app.fs_entries = entries
-                app.fs_source = source
+                # A scan that was abandoned (its thread stuck on a device) must not replace the
+                # results of the scan that is current now.
+                if not job.abandoned and jobs.current is job:
+                    app.fs_entries = entries
+                    app.fs_source = source
                 return {"count": len(entries), "source": source}
 
             job = jobs.start("fs_scan", "Cari file dihapus", run, unit="items")
@@ -443,6 +493,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("file tidak ditemukan")
             entry = app.fs_entries[idx]
             src = app.fs_source
+            # The preview is written to the temp folder: refuse it when that folder is on the scanned disk.
+            check_destination(src, app.preview_dir)
 
             def run(job):
                 job.set_phase("Menyiapkan pratinjau", entry.name)
@@ -469,7 +521,7 @@ class Handler(BaseHTTPRequestHandler):
             exts = [str(e) for e in body.get("exts", [])] or None
             date_range = make_range(body.get("from", ""), body.get("to", ""))
             check_destination(source, out)
-            if not is_device_path(source) and not os.path.exists(source):
+            if not guarded_exists(source):
                 raise FileNotFoundError(f"Sumber tidak ditemukan: {source}")
 
             def run(job):
@@ -516,7 +568,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/repair":
             src = self._need(body, "source")
             out = self._need(body, "out")
-            if not os.path.exists(src):
+            if not guarded_exists(src):
                 raise FileNotFoundError(f"Tidak ditemukan: {src}")
 
             def run(job):
@@ -572,13 +624,16 @@ class Handler(BaseHTTPRequestHandler):
             dev = self._need(body, "device")
             mode = str(body.get("mode", "check"))
             cmd = repair_command(dev, mode)  # raises ValueError for refused devices
+            read_only = is_read_only_check(cmd)
 
             def run(job):
                 job.set_phase("Menjalankan " + cmd[0], " ".join(cmd))
-                code, output = run_repair(cmd)
-                return {"code": code, "output": output, "command": " ".join(cmd)}
+                code, output = run_repair(cmd, cancel=job.cancel_event)
+                return {"code": code, "output": output, "command": " ".join(cmd),
+                        "cancelled": job.cancelled and read_only}
 
-            job = jobs.start("flash_repair", "Perbaikan sistem file", run)
+            # Only the read-only check can be stopped. A repair that writes runs to the end.
+            job = jobs.start("flash_repair", "Perbaikan sistem file", run, cancellable=read_only)
             return self._json(202, {"started": job.name})
 
         if path == "/api/capacity":

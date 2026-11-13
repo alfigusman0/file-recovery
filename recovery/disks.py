@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import threading
+import time
 from typing import Optional
 
 from .flashcheck import NOT_RESPONDING, PROBE_TIMEOUT, STUCK, device_key, run_with_timeout
@@ -103,9 +104,11 @@ def _raw_list() -> list[tuple[str, str]]:
 
 LIST_KEY = "__disk_list__"
 LIST_COOLDOWN = 30.0
+LIST_CACHE_TTL = 5.0         # seconds a fresh list is reused, so the UI polling does not run PowerShell each time
 STUCK_TAG = " [tidak merespons]"
 _cache_lock = threading.Lock()
 _cache: Optional[list[tuple[str, str]]] = None
+_cache_at = 0.0
 
 
 class DiskInfo(tuple):
@@ -126,11 +129,19 @@ class DiskInfo(tuple):
 
 
 def _refresh() -> list[tuple[str, str]]:
-    global _cache
+    global _cache, _cache_at
     disks = _raw_list()
     with _cache_lock:  # a late answer after a timeout still refreshes the cache
         _cache = disks
+        _cache_at = time.monotonic()
     return disks
+
+
+def _fresh_cache() -> Optional[list[tuple[str, str]]]:
+    with _cache_lock:
+        if _cache is not None and time.monotonic() - _cache_at < LIST_CACHE_TTL:
+            return list(_cache)
+    return None
 
 
 def _fallback() -> list[tuple[str, str]]:
@@ -152,9 +163,13 @@ def list_disks_info(timeout: float = PROBE_TIMEOUT) -> dict:
     "stuck_devices": {...}}. When the OS query hangs, the last known list (or plain
     drive letters) comes back with partial=True.
     """
-    res = run_with_timeout(_refresh, timeout=timeout, key=LIST_KEY, cooldown=LIST_COOLDOWN)
+    fresh = _fresh_cache()
+    res = None if fresh is not None else run_with_timeout(_refresh, timeout=timeout, key=LIST_KEY,
+                                                          cooldown=LIST_COOLDOWN)
     partial, message = False, ""
-    if res.ok:
+    if fresh is not None:
+        raw = fresh
+    elif res.ok:
         raw = res.value or []
     else:
         partial = True

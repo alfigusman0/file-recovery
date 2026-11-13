@@ -286,6 +286,7 @@ class HangProtectionTests(unittest.TestCase):
         self.assertIn("tidak merespons", info["disks"][0]["desc"])
 
         # The OS query hangs: the cached list comes back fast, marked partial.
+        disks._cache_at = 0.0  # the list is stale now, so the OS query really runs
         with mock.patch.object(disks, "_raw_list", side_effect=lambda: self.release.wait(10) or []):
             t0 = time.monotonic()
             info = disks.list_disks_info(timeout=0.2)

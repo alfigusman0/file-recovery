@@ -17,7 +17,9 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -297,16 +299,54 @@ def repair_command(device: str, mode: str = "check") -> list[str]:
     return ["fsck", "-n", device]
 
 
-def run_repair(cmd: list[str], timeout: int = 3600, runner: Optional[Callable] = None) -> tuple[int, str]:
-    """Run the repair command and return (exit_code, output). `runner` is injectable for tests."""
+def is_read_only_check(cmd: list[str]) -> bool:
+    """True for commands that only read the device (chkdsk without /f, fsck -n, diskutil verify).
+
+    Only these may be stopped part way: killing a repair that writes (chkdsk /f, fsck -y,
+    diskutil repair) can leave the file system more damaged than it was.
+    """
+    return "/f" not in [c.lower() for c in cmd] and "-y" not in cmd and "repairVolume" not in cmd
+
+
+def run_repair(cmd: list[str], timeout: int = 3600, runner: Optional[Callable] = None,
+               cancel: Optional[threading.Event] = None) -> tuple[int, str]:
+    """Run the repair command and return (exit_code, output). `runner` is injectable for tests.
+
+    When `cancel` is set and the command is read-only, the process is stopped and the
+    result is (-1, output) with a note. A repairing command is never stopped: it runs to the end.
+    """
     if runner is not None:
         return runner(cmd)
     if shutil.which(cmd[0]) is None:
         raise RuntimeError(f"Perintah {cmd[0]} tidak ditemukan di sistem ini")
-    # stdin=DEVNULL: chkdsk may ask a Y/N question; with no input it must not wait forever.
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False,
-                          stdin=subprocess.DEVNULL)
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    stoppable = is_read_only_check(cmd)
+    # Output goes to a temp file, not a pipe: a pipe could fill up while we only poll.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as out:
+        # stdin=DEVNULL: chkdsk may ask a Y/N question; with no input it must not wait forever.
+        proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        started = time.monotonic()
+        stopped = False
+        while True:
+            try:
+                code = proc.wait(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if cancel is not None and cancel.is_set() and stoppable and not stopped:
+                proc.kill()
+                proc.wait()
+                stopped = True
+                code = -1
+                break
+            if time.monotonic() - started > timeout:
+                proc.kill()
+                proc.wait()
+                raise TimeoutError(f"{cmd[0]} lebih dari {timeout} detik dan dihentikan")
+        out.seek(0)
+        output = out.read()
+    if stopped:
+        output += "\n[Dibatalkan oleh pengguna; pemeriksaan read-only dihentikan.]"
+    return code, output
 
 
 def is_raw_device(device: str) -> bool:

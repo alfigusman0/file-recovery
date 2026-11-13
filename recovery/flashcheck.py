@@ -434,10 +434,37 @@ def _remove_folder(folder: str) -> str:
         return str(exc)
 
 
+_ACTIVE_LOCK = threading.Lock()
+_ACTIVE_TARGETS: set[str] = set()   # folders with a capacity test still running in this process
+
+
 def capacity_test(target_dir: str, total_mb: int,
                   cancel: Optional[threading.Event] = None,
                   progress: Optional[Callable[[str, int, int], None]] = None,
                   file_mb: int = 1024, block_size: int = MIB) -> CapacityResult:
+    """Run one capacity test per folder at a time (see _capacity_test).
+
+    A test that was abandoned after a cancel can still be running in its thread. A second
+    test on the same folder would delete the first one's files, so it is refused until the
+    first one has finished.
+    """
+    target = check_capacity_target(target_dir)
+    with _ACTIVE_LOCK:
+        if target in _ACTIVE_TARGETS:
+            raise CapacityRefused("Uji kapasitas di drive ini masih berjalan (mungkin tertahan). "
+                                  "Tunggu sampai selesai, lalu coba lagi.")
+        _ACTIVE_TARGETS.add(target)
+    try:
+        return _capacity_test(target, total_mb, cancel, progress, file_mb, block_size)
+    finally:
+        with _ACTIVE_LOCK:
+            _ACTIVE_TARGETS.discard(target)
+
+
+def _capacity_test(target_dir: str, total_mb: int,
+                   cancel: Optional[threading.Event] = None,
+                   progress: Optional[Callable[[str, int, int], None]] = None,
+                   file_mb: int = 1024, block_size: int = MIB) -> CapacityResult:
     """Fake-capacity test (like H2testw): write known data, read it back, compare every block.
 
     WARNING: this fills FREE SPACE in target_dir with test data (up to total_mb MB, or all
