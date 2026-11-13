@@ -177,14 +177,44 @@ def filter_by_deletion(items: list[TrashItem], date_range) -> tuple[list[TrashIt
     return kept, skipped
 
 
+class RestoreError(OSError):
+    """Some (or all) files of a trash item could not be copied.
+
+    `target` is where the item was restored to; `failures` lists (path, reason)
+    for each file that failed. Subclass of OSError, so callers that handle
+    OSError per item keep working.
+    """
+
+    def __init__(self, target: str, failures: list[tuple[str, str]]) -> None:
+        self.target = target
+        self.failures = failures
+        first = "; ".join(f"{p}: {r}" for p, r in failures[:3])
+        more = f" (+{len(failures) - 3} lagi)" if len(failures) > 3 else ""
+        super().__init__(f"{len(failures)} file gagal disalin ke {target}: {first}{more}")
+
+
 def restore(item: TrashItem, destination_dir: str) -> str:
-    """Copy a trash item to destination_dir (never moves/deletes the trash copy)."""
+    """Copy a trash item (file or folder) to destination_dir (never moves/deletes the trash copy).
+
+    A deleted folder ($R folder on Windows, a directory in Linux Trash/files) is
+    copied with all its contents. Files inside it that cannot be copied do not
+    stop the rest; they are reported together in a RestoreError afterwards.
+    """
     os.makedirs(destination_dir, exist_ok=True)
     target = os.path.join(destination_dir, item.name)
-    base, ext = os.path.splitext(target)
+    is_dir = os.path.isdir(item.data_path)
+    base, ext = (target, "") if is_dir else os.path.splitext(target)
     n = 1
     while os.path.exists(target):
         target = f"{base}_{n}{ext}"
         n += 1
-    shutil.copy2(item.data_path, target)
+    if not is_dir:
+        shutil.copy2(item.data_path, target)
+        return target
+    try:
+        shutil.copytree(item.data_path, target, symlinks=True)
+    except shutil.Error as exc:
+        failures = [(str(e[0]), str(e[2])) for e in exc.args[0]] if exc.args and isinstance(exc.args[0], list) \
+            else [(item.data_path, str(exc))]
+        raise RestoreError(target, failures) from exc
     return target

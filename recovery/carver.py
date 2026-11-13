@@ -28,6 +28,7 @@ MIN_FILE_SIZE = 1024
 CHECK_READ = 4096      # bytes read for Signature.check
 DATE_READ = 200_000    # bytes read to find an embedded date
 SCAN_HEAD = 256 * 1024  # bytes read to find where JPEG image data starts
+SCAN_HEAD_MAX = 4 * 1024 * 1024  # upper bound when the JPEG header segments are larger
 
 
 @dataclass
@@ -79,6 +80,85 @@ def read_at(f: BinaryIO, pos: int, size: int) -> bytes:
     data = f.read(span)
     start = pos - aligned
     return data[start:start + size]
+
+
+class _TolerantFile:
+    """File wrapper whose reads never raise OSError for unreadable sectors.
+
+    A failed read is retried sector by sector (ALIGN bytes); sectors that still
+    fail are zero-filled, like imaging.py does for bad blocks, so one bad sector
+    does not abort a whole carve. `bad_bytes` counts the zero-filled bytes.
+    """
+
+    def __init__(self, f: BinaryIO, total: int) -> None:
+        self.f = f
+        self.total = total
+        self._pos = 0
+        self.bad_bytes = 0
+
+    def seek(self, pos: int, whence: int = os.SEEK_SET) -> int:
+        if whence == os.SEEK_SET:
+            self._pos = pos
+            return pos
+        self._pos = self.f.seek(pos, whence)
+        return self._pos
+
+    def tell(self) -> int:
+        return self._pos
+
+    def read(self, size: int) -> bytes:
+        pos = self._pos
+        try:
+            self.f.seek(pos)
+            data = self.f.read(size)
+        except OSError:
+            data = self._read_slow(pos, size)
+        data = data or b""
+        self._pos = pos + len(data)
+        return data
+
+    def _read_slow(self, pos: int, size: int) -> bytes:
+        out = bytearray()
+        readable_any = False
+        off = 0
+        while off < size:
+            at = pos + off
+            if self.total and at >= self.total:
+                break
+            length = min(ALIGN - (at % ALIGN), size - off)
+            if self.total:
+                length = min(length, self.total - at)
+            try:
+                self.f.seek(at)
+                part = self.f.read(length)
+            except OSError:
+                part = None
+            if part is None:
+                if not self.total and not readable_any:
+                    break  # unknown size and nothing readable from here: treat as end
+                part = b"\x00" * length
+                self.bad_bytes += length
+            elif part:
+                readable_any = True
+            else:
+                break  # end of data
+            out += part
+            off += len(part)
+            if len(part) < length:
+                break
+        return bytes(out)
+
+
+def _open_source(source: str) -> BinaryIO:
+    """Open the carve source read-only (tests replace this with a fake reader)."""
+    return open(source, "rb", buffering=0)
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def source_size(f: BinaryIO) -> int:
@@ -168,14 +248,18 @@ class _CachedReader:
 def _copy_range(f: BinaryIO, start: int, length: int, out_path: str,
                 cancel: Optional[threading.Event]) -> int:
     written = 0
-    with open(out_path, "wb") as out:
-        while written < length:
-            _check_cancel(cancel)
-            block = read_at(f, start + written, min(EXTRACT_BLOCK, length - written))
-            if not block:
-                break
-            out.write(block)
-            written += len(block)
+    try:
+        with open(out_path, "wb") as out:
+            while written < length:
+                _check_cancel(cancel)
+                block = read_at(f, start + written, min(EXTRACT_BLOCK, length - written))
+                if not block:
+                    break
+                out.write(block)
+                written += len(block)
+    except CancelledError:
+        _remove_quietly(out_path)  # a half-written file must not look recovered
+        raise
     return written
 
 
@@ -239,8 +323,6 @@ def extract_file(
         return _extract_walked(f, sig, start, out_path, end_limit, cancel)
 
     footer = sig.footer
-    extra = sig.footer_extra
-    keep = len(footer) - 1 if footer else 0
     end_limit = start + sig.max_size
     if limit is not None:
         end_limit = min(end_limit, limit)
@@ -249,12 +331,49 @@ def extract_file(
 
     # Where footer search may begin (JPEG: after the header segments, so an EXIF thumbnail is skipped)
     footer_from = start
+    start_unknown = False  # True when scan_start could not find where image data starts
     if sig.scan_start is not None:
-        head = read_at(f, start, SCAN_HEAD)
-        rel = sig.scan_start(head)
+        want = SCAN_HEAD
+        while True:
+            head = read_at(f, start, want)
+            rel = sig.scan_start(head)
+            if rel is not None or len(head) < want or want >= SCAN_HEAD_MAX:
+                break
+            want = min(want * 4, SCAN_HEAD_MAX)  # header segments are larger: read further
         if rel is not None:
             footer_from = start + rel
+        else:
+            # The first footer may belong to an embedded thumbnail: the end is only a guess.
+            start_unknown = True
 
+    try:
+        written, complete = _extract_footer(f, sig, start, out_path, end_limit, footer_from, cancel)
+    except CancelledError:
+        _remove_quietly(out_path)  # a half-written file must not look recovered
+        raise
+
+    if written == 0 or (not complete and written < MIN_FILE_SIZE):
+        os.remove(out_path)
+        return 0, False, CONFIDENCE_LOW
+    if not footer:
+        # No footer defined; accept what was read. The end is only a guess
+        # (next file of the same type, end of source or max_size).
+        return written, True, CONFIDENCE_LOW
+    if not complete:
+        return written, False, CONFIDENCE_LOW
+    if start_unknown:
+        return written, True, CONFIDENCE_LOW
+    return written, True, CONFIDENCE_HIGH if sig.check is not None else CONFIDENCE_MEDIUM
+
+
+def _extract_footer(
+    f: BinaryIO, sig: Signature, start: int, out_path: str, end_limit: int,
+    footer_from: int, cancel: Optional[threading.Event],
+) -> tuple[int, bool]:
+    """Copy from `start` up to the footer (or end_limit). Returns (written, complete)."""
+    footer = sig.footer
+    extra = sig.footer_extra
+    keep = len(footer) - 1 if footer else 0
     written = 0
     complete = False
     last_end: Optional[int] = None   # footer_last: absolute end of the last footer seen
@@ -325,17 +444,7 @@ def extract_file(
                 out.truncate(last_end - start)
                 written = last_end - start
                 complete = True
-
-    if written == 0 or (not complete and written < MIN_FILE_SIZE):
-        os.remove(out_path)
-        return 0, False, CONFIDENCE_LOW
-    if not footer:
-        # No footer defined; accept what was read. The end is only a guess
-        # (next file of the same type, end of source or max_size).
-        return written, True, CONFIDENCE_LOW
-    if not complete:
-        return written, False, CONFIDENCE_LOW
-    return written, True, CONFIDENCE_HIGH if sig.check is not None else CONFIDENCE_MEDIUM
+    return written, complete
 
 
 def carve(
@@ -375,60 +484,82 @@ def carve_summary(
     if not sigs:
         raise ValueError("No signatures match the requested extensions")
 
-    recovered: list[RecoveredFile] = []
-    skipped_by_date = 0
-    skipped_inside = 0
-    cancelled = False
+    summary = CarveSummary([], 0, False, 0)
     report = os.path.join(out_dir, "recovery_report.json")
-    with open(source, "rb", buffering=0) as f:
-        total = source_size(f)
-        try:
-            candidates = find_candidates(f, sigs, total, progress, cancel)
-            # Start of the next candidate of the same type, used as an upper bound.
-            by_name: dict[str, list[int]] = {}
-            for sig, start in candidates:
-                by_name.setdefault(sig.name, []).append(start)
-            counters: dict[str, int] = {}
-            covered_until = -1  # end of the last file written; later hits inside it are copies
-            n_candidates = len(candidates)
-            for index, (sig, start) in enumerate(candidates, 1):
-                _check_cancel(cancel)
-                if phase is not None:
-                    phase("Menulis file", index, n_candidates)
-                if max_files is not None and len(recovered) >= max_files:
-                    break
-                if start < covered_until:
-                    skipped_inside += 1
-                    continue
-                # Only formats without a self-terminating footer need the next-file bound.
-                # (A ZIP's local headers are all candidates; its EOCD ends it, so it must not be cut.)
-                # Structure-walked formats find their own end (a false header inside
-                # e.g. an MP4 mdat must not cut the real file short).
-                limit = None
-                if sig.walk is None and (sig.footer is None or sig.footer_last):
-                    starts = by_name[sig.name]
-                    nxt = bisect.bisect_right(starts, start)
-                    limit = starts[nxt] if nxt < len(starts) else None
-                if date_range is not None and date_range.active:
-                    head = read_at(f, start, DATE_READ)
-                    try:
-                        when = embedded_datetime(sig.name, head)
-                    except Exception:  # noqa: BLE001 - a broken date must not stop the scan
-                        when = None
-                    if not date_range.contains(when):
-                        skipped_by_date += 1
-                        continue
-                counters[sig.extension] = counters.get(sig.extension, 0) + 1
-                name = f"{sig.name}_{counters[sig.extension]:05d}_{start:x}.{sig.extension}"
-                out_path = os.path.join(out_dir, name)
-                size, complete, confidence = extract_file(
-                    f, sig, start, out_path, total, limit=limit, cancel=cancel)
-                if size:
-                    recovered.append(RecoveredFile(out_path, sig.name, start, size, complete, confidence))
-                    covered_until = start + size
-        except CancelledError:
-            cancelled = True
+    try:
+        with _open_source(source) as raw:
+            total = source_size(raw)
+            f = _TolerantFile(raw, total)  # unreadable sectors are zero-filled, not fatal
+            try:
+                _carve_candidates(f, sigs, total, out_dir, summary, progress, max_files,
+                                  date_range, cancel, phase)
+            except CancelledError:
+                summary.cancelled = True
+    finally:
+        # Always write the report, even when the carve stopped on an unexpected error.
+        with open(report, "w", encoding="utf-8") as fh:
+            json.dump([asdict(r) for r in summary.recovered], fh, indent=2)
+    return summary
 
-    with open(report, "w", encoding="utf-8") as fh:
-        json.dump([asdict(r) for r in recovered], fh, indent=2)
-    return CarveSummary(recovered, skipped_by_date, cancelled, skipped_inside)
+
+def _carve_candidates(
+    f: BinaryIO,
+    sigs: list[Signature],
+    total: int,
+    out_dir: str,
+    summary: CarveSummary,
+    progress: Optional[ProgressFn],
+    max_files: Optional[int],
+    date_range: Optional[DateRange],
+    cancel: Optional[threading.Event],
+    phase: Optional[Callable[[str, int, int], None]],
+) -> None:
+    """Pass 1 (find headers) + pass 2 (write files). Fills `summary` as it goes."""
+    recovered = summary.recovered
+    candidates = find_candidates(f, sigs, total, progress, cancel)
+    # Start of the next candidate of the same type, used as an upper bound.
+    by_name: dict[str, list[int]] = {}
+    for sig, start in candidates:
+        by_name.setdefault(sig.name, []).append(start)
+    counters: dict[str, int] = {}
+    # End of the last file whose end is trusted; later hits inside it are copies.
+    covered_until = -1
+    n_candidates = len(candidates)
+    for index, (sig, start) in enumerate(candidates, 1):
+        _check_cancel(cancel)
+        if phase is not None:
+            phase("Menulis file", index, n_candidates)
+        if max_files is not None and len(recovered) >= max_files:
+            break
+        if start < covered_until:
+            summary.skipped_inside_other += 1
+            continue
+        # Only formats without a self-terminating footer need the next-file bound.
+        # (A ZIP's local headers are all candidates; its EOCD ends it, so it must not be cut.)
+        # Structure-walked formats find their own end (a false header inside
+        # e.g. an MP4 mdat must not cut the real file short).
+        limit = None
+        if sig.walk is None and (sig.footer is None or sig.footer_last):
+            starts = by_name[sig.name]
+            nxt = bisect.bisect_right(starts, start)
+            limit = starts[nxt] if nxt < len(starts) else None
+        if date_range is not None and date_range.active:
+            head = read_at(f, start, DATE_READ)
+            try:
+                when = embedded_datetime(sig.name, head)
+            except Exception:  # noqa: BLE001 - a broken date must not stop the scan
+                when = None
+            if not date_range.contains(when):
+                summary.skipped_by_date += 1
+                continue
+        counters[sig.extension] = counters.get(sig.extension, 0) + 1
+        name = f"{sig.name}_{counters[sig.extension]:05d}_{start:x}.{sig.extension}"
+        out_path = os.path.join(out_dir, name)
+        size, complete, confidence = extract_file(
+            f, sig, start, out_path, total, limit=limit, cancel=cancel)
+        if size:
+            recovered.append(RecoveredFile(out_path, sig.name, start, size, complete, confidence))
+            # A guessed end (no footer, max_size, next header) must not hide the
+            # real files that follow, so only a trusted end covers later hits.
+            if complete and confidence != CONFIDENCE_LOW:
+                covered_until = start + size

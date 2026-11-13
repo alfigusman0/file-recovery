@@ -129,16 +129,30 @@ EOCD_SIG = b"PK\x05\x06"
 DESC_SIG = b"PK\x07\x08"
 
 
-def _inflate_exact(buf: bytes) -> tuple[Optional[bytes], int]:
-    """Decompress raw deflate from buf. Returns (content, bytes_consumed) or (None, 0) if incomplete."""
+_INFLATE_CHUNK = 64 * 1024
+
+
+def _inflate_exact(buf) -> tuple[Optional[bytes], int]:
+    """Decompress raw deflate from buf. Returns (content, bytes_consumed) or (None, 0) if incomplete.
+
+    buf may be bytes or a memoryview. Input is fed in chunks of a memoryview, so
+    neither the rest of the archive nor zlib's unused_data is copied (a copy per
+    entry made big archives with data descriptors quadratic).
+    """
+    mv = memoryview(buf)
     d = zlib.decompressobj(-15)
+    parts: list[bytes] = []
+    fed = 0
     try:
-        out = d.decompress(buf)
+        while fed < len(mv) and not d.eof:
+            chunk = mv[fed:fed + _INFLATE_CHUNK]
+            fed += len(chunk)
+            parts.append(d.decompress(chunk))
     except zlib.error:
         return None, 0
     if not d.eof:
         return None, 0
-    return out, len(buf) - len(d.unused_data)
+    return b"".join(parts), fed - len(d.unused_data)
 
 
 def _unix_time(dos_time: int, dos_date: int) -> tuple[int, int]:
@@ -174,7 +188,7 @@ def _read_entry(data: bytes, dstart: int, method: int, flags: int, crc_hdr: int,
 
     # Bit 3 set: sizes and CRC follow the data in a data descriptor.
     if method == 8:
-        content, consumed = _inflate_exact(data[dstart:])
+        content, consumed = _inflate_exact(memoryview(data)[dstart:])  # no copy of the tail
         if content is None:
             return None, None, 0, dstart, "deflate stream incomplete or corrupt"
         raw = data[dstart:dstart + consumed]
@@ -214,8 +228,16 @@ def repair_zip(data: bytes) -> tuple[Optional[bytes], list[str]]:
     Works when the end-of-central-directory record is missing or corrupt,
     which is typical for partially deleted or truncated archives. Only entries
     whose content verifies (CRC and size) are written to the output.
+    Archives that need ZIP64 (sizes or offsets of 4 GB or more) fail cleanly.
     """
     actions: list[str] = []
+    try:
+        return _repair_zip(data, actions)
+    except struct.error as exc:
+        return None, actions + [f"archive needs ZIP64 (offset or size of 4 GB or more), not supported: {exc}"]
+
+
+def _repair_zip(data: bytes, actions: list[str]) -> tuple[Optional[bytes], list[str]]:
     entries: list[dict] = []
     pos = data.find(LFH)
     if pos == -1:
@@ -284,8 +306,13 @@ def _quote_ident(name: str) -> str:
 
 
 def _sqlite_python_copy(path: str, out_path: str, actions: list[str]) -> bool:
-    """Copy readable tables with the Python driver, keeping schema and whatever rows are readable."""
-    src_uri = pathlib.Path(os.path.abspath(path)).as_uri() + "?mode=ro"
+    """Copy readable tables with the Python driver, keeping schema and whatever rows are readable.
+
+    `path` is always a temporary copy (see repair_sqlite), so it is opened
+    read-write: SQLite can then roll back a hot journal in the copy, which a
+    read-only connection refuses to do.
+    """
+    src_uri = pathlib.Path(os.path.abspath(path)).as_uri()
     src = sqlite3.connect(src_uri, uri=True)
     dst = sqlite3.connect(out_path)
     copied = 0
@@ -333,12 +360,42 @@ def _sqlite_python_copy(path: str, out_path: str, actions: list[str]) -> bool:
     return copied > 0
 
 
+_SQLITE_SIDE_FILES = ("-journal", "-wal", "-shm")
+
+
+def _copy_sqlite_to(path: str, folder: str) -> str:
+    """Copy a database and its -journal / -wal / -shm files into folder; returns the copy's path.
+
+    SQLite opens a database read-write and rolls back a hot journal (or replays a
+    WAL) when it opens it, which would modify the original. Recovering a copy
+    keeps the original untouched, while the copy still sees the journal data.
+    """
+    copy = os.path.join(folder, "source.sqlite")
+    shutil.copyfile(path, copy)
+    for suffix in _SQLITE_SIDE_FILES:
+        side = path + suffix
+        if os.path.isfile(side):
+            shutil.copyfile(side, copy + suffix)
+    return copy
+
+
 def repair_sqlite(path: str, out_path: str) -> tuple[bool, list[str]]:
     """Recover readable tables from a corrupt SQLite database.
 
-    Writes to a temporary file first, so a failed attempt never leaves a broken output.
+    Works on a temporary copy of the database (and its journal / WAL), so the
+    original is never modified. Writes to a temporary file first, so a failed
+    attempt never leaves a broken output.
     """
     actions: list[str] = []
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as work:
+        try:
+            src_copy = _copy_sqlite_to(path, work)
+        except OSError as exc:
+            return False, [f"cannot read file: {exc}"]
+        return _repair_sqlite_copy(src_copy, out_path, actions)
+
+
+def _repair_sqlite_copy(path: str, out_path: str, actions: list[str]) -> tuple[bool, list[str]]:
     out_dir = os.path.dirname(os.path.abspath(out_path))
     fd, tmp_out = tempfile.mkstemp(suffix=".sqlite", dir=out_dir)
     os.close(fd)

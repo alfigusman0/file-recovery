@@ -128,6 +128,7 @@ def mp4_walk(read: ReadFn, avail: int) -> Optional[tuple[int, bool]]:
     if pos > avail:
         return None
     seen_moov = False
+    cut_short = False  # True when a box runs past the available data
     while pos + 8 <= avail:
         h = read(pos, 16)
         if len(h) < 8:
@@ -151,13 +152,14 @@ def mp4_walk(read: ReadFn, avail: int) -> Optional[tuple[int, bool]]:
         if btype not in _BMFF_KNOWN_TOP and size > _BMFF_UNKNOWN_MAX:
             break
         if pos + size > avail:  # box runs past the data we may use: stop at the last whole box
+            cut_short = True
             break
         pos += size
         if btype == b"moov":
             seen_moov = True
         if to_end:
             break
-    return pos, seen_moov
+    return pos, seen_moov and not cut_short
 
 
 # --- MPEG audio (MP3) -----------------------------------------------------
@@ -246,7 +248,11 @@ def mp3_walk(read: ReadFn, avail: int) -> Optional[tuple[int, bool]]:
         pos = tag + rel
     first = None
     frames = 0
-    while pos + 4 <= avail:
+    hit_limit = False  # stopped because the available data ran out, not at the stream's end
+    while True:
+        if pos + 4 > avail:
+            hit_limit = True
+            break
         info = mp3_frame_info(read(pos, 4))
         if info is None:
             break
@@ -255,11 +261,89 @@ def mp3_walk(read: ReadFn, avail: int) -> Optional[tuple[int, bool]]:
         elif info[1:] != first:
             break
         if pos + info[0] > avail:
+            hit_limit = True
             break
         pos += info[0]
         frames += 1
     if frames < min_frames:
         return None
-    if pos + 128 <= avail and read(pos, 3) == b"TAG":
+    if not hit_limit and pos + 128 <= avail and read(pos, 3) == b"TAG":
         pos += 128
-    return pos, True
+    return pos, not hit_limit
+
+
+# --- GIF ------------------------------------------------------------------
+
+def _gif_skip_sub_blocks(read: ReadFn, pos: int, avail: int) -> Optional[int]:
+    """Skip data sub-blocks (length byte + data) up to the 0x00 terminator.
+
+    Returns the offset after the terminator, or None when the data runs out.
+    """
+    while True:
+        if pos >= avail:
+            return None
+        n = read(pos, 1)
+        if not n:
+            return None
+        length = n[0]
+        pos += 1
+        if length == 0:
+            return pos
+        pos += length
+
+
+def gif_walk(read: ReadFn, avail: int) -> Optional[tuple[int, bool]]:
+    """Walk the GIF block structure to the trailer (0x3B).
+
+    The 00 3B byte pair also occurs inside LZW image data, so a footer search
+    cuts files short; following the blocks finds the real end. Returns None
+    for a bad header, (end, True) at the trailer, and (end_of_last_whole_block,
+    False) when the structure breaks, or (avail, False) when the data runs out
+    inside a block (a truncated GIF still shows its first part).
+    """
+    head = read(0, 13)
+    if len(head) < 13 or head[:6] not in (b"GIF87a", b"GIF89a"):
+        return None
+    packed = head[10]
+    pos = 13
+    if packed & 0x80:  # global color table
+        pos += 3 * (1 << ((packed & 0x07) + 1))
+    if pos > avail:
+        return None
+    last_good = pos
+    images = 0
+    while pos < avail:
+        b = read(pos, 1)
+        if not b:
+            break
+        block = b[0]
+        if block == 0x3B:  # trailer
+            return pos + 1, True
+        if block == 0x21:  # extension: label byte + sub-blocks
+            if pos + 2 > avail:
+                break
+            nxt = _gif_skip_sub_blocks(read, pos + 2, avail)
+        elif block == 0x2C:  # image descriptor (9 bytes) [+ local color table] + LZW data
+            desc = read(pos + 1, 9)
+            if len(desc) < 9:
+                break
+            p = pos + 10
+            if desc[8] & 0x80:
+                p += 3 * (1 << ((desc[8] & 0x07) + 1))
+            if p >= avail:
+                break
+            code_size = read(p, 1)
+            if not code_size or not 1 <= code_size[0] <= 12:
+                break  # not a valid LZW minimum code size: corrupt
+            nxt = _gif_skip_sub_blocks(read, p + 1, avail)
+            if nxt is not None:
+                images += 1
+        else:
+            break  # unknown block: corrupt or overwritten
+        if nxt is None or nxt > avail:
+            # Data ran out inside a block (truncated file): keep what is there.
+            return avail, False
+        pos = last_good = nxt
+    if images == 0:
+        return None
+    return last_good, False

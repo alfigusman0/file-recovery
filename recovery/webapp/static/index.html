@@ -51,8 +51,8 @@
       <div class="grid">
         <div class="card col-12">
           <div class="row">
-            <div class="field"><label>Dihapus dari</label><input type="date" id="trash-from"></div>
-            <div class="field"><label>Sampai</label><input type="date" id="trash-to"></div>
+            <div class="field"><label for="trash-from">Dihapus dari</label><input type="date" id="trash-from"></div>
+            <div class="field"><label for="trash-to">Sampai</label><input type="date" id="trash-to"></div>
             <div class="field" style="flex:0 0 auto"><label>&nbsp;</label>
               <div class="input-group"><button class="btn" id="trash-apply">Terapkan</button>
               <button class="btn btn-ghost" id="trash-clear">Hapus filter</button></div>
@@ -68,9 +68,10 @@
             <button class="btn btn-primary" id="trash-restore" disabled>Pulihkan yang dipilih</button>
           </div>
           <div class="table-wrap">
-            <table><thead><tr><th style="width:36px"><input type="checkbox" id="trash-all"></th><th>Nama</th><th class="num">Ukuran</th><th>Dihapus</th><th>Lokasi asal</th></tr></thead>
+            <table><thead><tr><th style="width:36px"><input type="checkbox" id="trash-all" aria-label="Pilih semua item trash"></th><th>Nama</th><th class="num">Ukuran</th><th>Dihapus</th><th>Lokasi asal</th></tr></thead>
             <tbody id="trash-body"></tbody></table>
           </div>
+          <div class="muted small" id="trash-limit" style="margin-top:8px" hidden></div>
           <div class="muted small" style="margin-top:8px">Waktu hapus diambil dari metadata trash. Kosongkan tanggal untuk menampilkan semua.</div>
         </div>
       </div>
@@ -82,13 +83,13 @@
       <div class="grid">
         <div class="card col-12">
           <div class="row">
-            <div class="field"><label>Sumber (disk / image)</label>
-              <div class="input-group"><select id="fs-disk"></select><button class="btn" data-browse="fs-src" data-mode="file">Pilih file</button></div>
+            <div class="field"><label for="fs-src">Sumber (disk / image)</label>
+              <div class="input-group"><label for="fs-disk" class="sr-only">Pilih disk sumber</label><select id="fs-disk"></select><button class="btn" data-browse="fs-src" data-mode="file">Pilih file</button></div>
               <input type="text" id="fs-src" placeholder="contoh: \\.\C: atau D:\disk.img" style="margin-top:6px">
               <div class="stuck-note" data-stuck-note="fs" hidden></div>
             </div>
-            <div class="field" style="flex:0 0 auto"><label>Dihapus dari</label><input type="date" id="fs-from"></div>
-            <div class="field" style="flex:0 0 auto"><label>Sampai</label><input type="date" id="fs-to"></div>
+            <div class="field" style="flex:0 0 auto"><label for="fs-from">Dihapus dari</label><input type="date" id="fs-from"></div>
+            <div class="field" style="flex:0 0 auto"><label for="fs-to">Sampai</label><input type="date" id="fs-to"></div>
             <div class="field" style="flex:0 0 auto"><label>&nbsp;</label><button class="btn btn-primary" id="fs-scan">Cari file dihapus</button></div>
           </div>
         </div>
@@ -124,25 +125,25 @@
       <div class="grid">
         <div class="card col-12">
           <div class="row">
-            <div class="field"><label>Sumber (disk / image)</label>
-              <div class="input-group"><select id="carve-disk"></select><button class="btn" data-browse="carve-src" data-mode="file">Pilih file</button></div>
+            <div class="field"><label for="carve-src">Sumber (disk / image)</label>
+              <div class="input-group"><label for="carve-disk" class="sr-only">Pilih disk sumber</label><select id="carve-disk"></select><button class="btn" data-browse="carve-src" data-mode="file">Pilih file</button></div>
               <input type="text" id="carve-src" placeholder="contoh: \\.\E: atau D:\disk.img" style="margin-top:6px">
               <div class="stuck-note" data-stuck-note="carve" hidden></div>
             </div>
-            <div class="field"><label>Simpan hasil ke</label>
+            <div class="field"><label for="carve-out">Simpan hasil ke</label>
               <div class="input-group"><input type="text" id="carve-out"><button class="btn" data-browse="carve-out" data-mode="dir">Pilih folder</button></div>
             </div>
           </div>
           <div class="row" style="margin-top:14px">
-            <div class="field" style="flex:0 0 auto"><label>Tanggal di dalam file dari</label><input type="date" id="carve-from"></div>
-            <div class="field" style="flex:0 0 auto"><label>sampai</label><input type="date" id="carve-to"></div>
+            <div class="field" style="flex:0 0 auto"><label for="carve-from">Tanggal di dalam file dari</label><input type="date" id="carve-from"></div>
+            <div class="field" style="flex:0 0 auto"><label for="carve-to">sampai</label><input type="date" id="carve-to"></div>
             <div class="muted small" style="flex:1 1 260px">Kosong = semua file. Tanggal diambil dari isi file (EXIF foto, PDF, ZIP), bukan tanggal hapus.</div>
           </div>
         </div>
         <div class="card col-12">
-          <div class="card-head"><h3 style="margin:0">Jenis file</h3>
+          <div class="card-head"><h3 style="margin:0" id="ext-title">Jenis file</h3>
             <div class="toolbar" style="margin:0"><button class="btn btn-sm" id="ext-all">Pilih semua</button><button class="btn btn-sm" id="ext-none">Kosongkan</button></div></div>
-          <div class="chips" id="ext-chips"></div>
+          <div class="chips" id="ext-chips" role="group" aria-labelledby="ext-title"></div>
         </div>
         <div class="card col-12">
           <div class="card-head">
@@ -157,13 +158,13 @@
         </div>
         <div class="card col-12" id="carve-files-card" hidden>
           <div class="card-head"><h3 style="margin:0">File hasil carving</h3></div>
-          <div class="filters" id="carve-filters"></div>
+          <div class="filters" id="carve-filters" hidden></div>
           <div class="table-wrap">
-            <table><thead><tr><th>File</th><th>Jenis</th><th class="num">Ukuran</th><th>Status</th><th class="carve-conf-col">Keyakinan</th></tr></thead>
+            <table><thead><tr><th>File</th><th>Jenis</th><th class="num">Ukuran</th><th>Status</th><th class="carve-conf-col" hidden>Keyakinan</th></tr></thead>
             <tbody id="carve-body"></tbody></table>
           </div>
           <div class="muted small" id="carve-limit" style="margin-top:8px" hidden></div>
-          <details class="legend carve-conf-col">
+          <details class="legend carve-conf-col" hidden>
             <summary>Arti tingkat keyakinan</summary>
             <ul>
               <li><span class="tag ok">Tinggi</span> Struktur file lengkap dan cocok dari awal sampai akhir. Kemungkinan besar file bisa dibuka normal.</li>
@@ -181,12 +182,12 @@
       <div class="grid">
         <div class="card col-12">
           <div class="row">
-            <div class="field"><label>Disk / partisi yang disalin</label>
-              <div class="input-group"><select id="image-disk"></select><button class="btn" data-browse="image-src" data-mode="file">Pilih file</button></div>
+            <div class="field"><label for="image-src">Disk / partisi yang disalin</label>
+              <div class="input-group"><label for="image-disk" class="sr-only">Pilih disk yang disalin</label><select id="image-disk"></select><button class="btn" data-browse="image-src" data-mode="file">Pilih file</button></div>
               <input type="text" id="image-src" style="margin-top:6px">
               <div class="stuck-note" data-stuck-note="image" hidden></div>
             </div>
-            <div class="field"><label>File image tujuan</label>
+            <div class="field"><label for="image-out">File image tujuan</label>
               <div class="input-group"><input type="text" id="image-out"><button class="btn" data-browse="image-out" data-mode="save">Simpan ke</button></div>
             </div>
           </div>
@@ -202,8 +203,8 @@
       <div class="grid">
         <div class="card col-12">
           <div class="row">
-            <div class="field"><label>Perangkat</label>
-              <div class="input-group"><select id="flash-disk"></select><button class="btn" data-browse="flash-src" data-mode="file">File image</button></div>
+            <div class="field"><label for="flash-src">Perangkat</label>
+              <div class="input-group"><label for="flash-disk" class="sr-only">Pilih perangkat</label><select id="flash-disk"></select><button class="btn" data-browse="flash-src" data-mode="file">File image</button></div>
               <input type="text" id="flash-src" style="margin-top:6px">
               <div class="stuck-note" data-stuck-note="flash" hidden></div>
             </div>
@@ -262,9 +263,9 @@
       <div class="grid">
         <div class="card col-12">
           <div class="row">
-            <div class="field"><label>File atau folder yang rusak</label>
+            <div class="field"><label for="repair-src">File atau folder yang rusak</label>
               <div class="input-group"><input type="text" id="repair-src"><button class="btn" data-browse="repair-src" data-mode="any">Pilih</button></div></div>
-            <div class="field"><label>Simpan hasil ke</label>
+            <div class="field"><label for="repair-out">Simpan hasil ke</label>
               <div class="input-group"><input type="text" id="repair-out"><button class="btn" data-browse="repair-out" data-mode="dir">Pilih folder</button></div></div>
           </div>
           <div class="toolbar"><button class="btn btn-primary" id="repair-start">Perbaiki</button></div>
@@ -288,6 +289,7 @@
     <span class="tag" id="dbg-state">idle</span>
     <span class="muted small" id="dbg-count"></span>
     <span class="spacer"></span>
+    <label for="dbg-level" class="sr-only">Level log minimum</label>
     <select id="dbg-level" style="width:auto">
       <option value="ALL" selected>Semua level</option><option value="DEBUG">DEBUG</option>
       <option value="INFO">INFO</option><option value="WARNING">WARNING</option><option value="ERROR">ERROR</option>
@@ -295,7 +297,7 @@
     <label class="small muted"><input type="checkbox" id="dbg-follow" checked> ikuti</label>
     <button class="btn btn-sm" id="dbg-copy">Salin log</button>
     <button class="btn btn-sm" id="dbg-clear">Bersihkan</button>
-    <button class="btn btn-sm btn-icon" id="dbg-close" title="Tutup">✕</button>
+    <button class="btn btn-sm btn-icon" id="dbg-close" title="Tutup" aria-label="Tutup mode debug">✕</button>
   </div>
   <div class="body">
     <div class="status" id="dbg-status"></div>

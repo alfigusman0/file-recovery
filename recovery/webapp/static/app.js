@@ -33,6 +33,10 @@
     image: { src: "image-src", buttons: ["image-start"] },
     flash: { src: "flash-src", buttons: ["flash-diag", "flash-surface", "flash-image", "flash-carve", "flash-check", "flash-fix"] },
   };
+  // Buttons that start a server job: all disabled while any job runs.
+  const JOB_BUTTONS = ["trash-restore", "fs-scan", "fs-recover", "fs-preview", "carve-start", "image-start",
+    "repair-start", "flash-diag", "flash-surface", "flash-check", "flash-fix", "cap-start"];
+  const BUSY_TIP = "Pekerjaan lain sedang berjalan. Tunggu sampai selesai atau batalkan dulu.";
 
   const $ = (id) => document.getElementById(id);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
@@ -97,6 +101,21 @@
     return { from: $(fromId).value || "", to: $(toId).value || "" };
   }
   function baseName(p) { return String(p || "").split(/[\\/]/).filter(Boolean).pop() || String(p || ""); }
+
+  // Per-item problems reported by the server ("errors" / "problems"): first few messages plus a count.
+  function problemText(list, max = 3) {
+    if (!Array.isArray(list) || !list.length) return "";
+    const one = (x) => {
+      if (x === null || x === undefined) return "";
+      if (typeof x !== "object") return String(x);
+      const who = x.name || x.path || x.file || x.original || (x.id !== undefined ? `#${x.id}` : "");
+      const why = x.error || x.message || x.reason || x.problem || "";
+      return who && why ? `${baseName(who)}: ${why}` : String(who || why || JSON.stringify(x));
+    };
+    const head = list.slice(0, max).map(one).filter(Boolean).join("; ");
+    const rest = list.length - Math.min(list.length, max);
+    return head + (rest > 0 ? ` (+${rest} masalah lain)` : "");
+  }
 
   // ---------- result filters (client-side) ----------
 
@@ -213,19 +232,46 @@
 
   // ---------- modal ----------
 
+  let modalSeq = 0;
+  const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), ' +
+    'textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
   function modal(title, bodyHtml, footerHtml = "") {
+    const opener = document.activeElement;
+    const titleId = `modal-title-${++modalSeq}`;
     const back = document.createElement("div");
     back.className = "modal-back";
-    back.innerHTML = `<div class="modal" role="dialog" aria-modal="true">
-      <header><h3>${esc(title)}</h3><button class="btn btn-sm btn-icon" data-close>✕</button></header>
+    back.innerHTML = `<div class="modal" role="dialog" aria-modal="true" aria-labelledby="${titleId}" tabindex="-1">
+      <header><h3 id="${titleId}">${esc(title)}</h3><button type="button" class="btn btn-sm btn-icon" data-close aria-label="Tutup">✕</button></header>
       <div class="body">${bodyHtml}</div>
       ${footerHtml ? `<footer>${footerHtml}</footer>` : ""}</div>`;
-    const close = () => { back.remove(); document.removeEventListener("keydown", onKey); };
-    const onKey = (e) => { if (e.key === "Escape") close(); };
-    back.addEventListener("click", (e) => { if (e.target === back || e.target.dataset.close !== undefined) close(); });
-    document.addEventListener("keydown", onKey);
+    const dialog = back.querySelector(".modal");
+    const focusables = () => $$(FOCUSABLE, dialog).filter((el) => el.getClientRects().length > 0);
+    let closed = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      back.remove();
+      document.removeEventListener("keydown", onKey, true);
+      if (opener && opener !== document.body && opener.isConnected && typeof opener.focus === "function") opener.focus();
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); close(); return; }
+      if (e.key !== "Tab") return;
+      // keep Tab / Shift+Tab inside the dialog
+      const items = focusables();
+      if (!items.length) { e.preventDefault(); dialog.focus(); return; }
+      const first = items[0], last = items[items.length - 1], cur = document.activeElement;
+      const inside = dialog.contains(cur);
+      if (e.shiftKey) {
+        if (!inside || cur === first || cur === dialog) { e.preventDefault(); last.focus(); }
+      } else if (!inside || cur === last) { e.preventDefault(); first.focus(); }
+    };
+    back.addEventListener("click", (e) => { if (e.target === back || e.target.closest("[data-close]")) close(); });
+    document.addEventListener("keydown", onKey, true);
     document.body.appendChild(back);
-    return { root: back, close };
+    (focusables()[0] || dialog).focus();
+    return { root: back, close, isOpen: () => !closed };
   }
 
   // Built-in file/folder picker (works without native dialogs)
@@ -235,25 +281,34 @@
       <div class="row" style="margin-bottom:10px"><button class="btn btn-sm" id="br-up">⬆ Naik</button>
       <div id="br-roots" class="chips"></div></div>
       <div class="list" id="br-list"><div class="empty">Memuat…</div></div>`,
-      `${mode === "save" ? `<input type="text" id="br-name" value="hasil-pemulihan" style="max-width:260px">` : ""}
-       ${mode !== "file" ? `<button class="btn btn-primary" id="br-choose">Pilih folder ini</button>` : ""}`);
+      `${mode === "save" ? `<label for="br-name" class="small">Nama file</label><input type="text" id="br-name" value="hasil-pemulihan" style="max-width:260px">` : ""}
+       ${mode !== "file" ? `<button type="button" class="btn btn-primary" id="br-choose">Pilih folder ini</button>` : ""}`);
+    const q = (id) => m.root.querySelector("#" + id);
+    let reqSeq = 0;  // only the newest browse response may update the dialog
     const load = async (path) => {
+      const seq = ++reqSeq;
+      const fresh = () => seq === reqSeq && m.isOpen();
+      const choose = q("br-choose");
+      if (choose) choose.disabled = true;  // re-enabled once this folder is shown
       try {
         const data = await api("/api/browse?path=" + encodeURIComponent(path || ""));
+        if (!fresh()) return;
+        const pathEl = q("br-path"), up = q("br-up"), roots = q("br-roots"), list = q("br-list");
+        if (!pathEl || !up || !roots || !list) return;
         current = data.path || "";
-        $("br-path").textContent = current || "Pilih drive atau lokasi";
-        $("br-up").disabled = !data.parent;
-        $("br-up").onclick = () => load(data.parent || "");
-        $("br-roots").innerHTML = (data.roots || []).map((r) =>
-          `<button class="chip" data-root="${esc(r.path)}">${esc(r.name)}</button>`).join("");
-        $$("[data-root]", $("br-roots")).forEach((b) => b.onclick = () => load(b.dataset.root));
-        const list = $("br-list");
+        pathEl.textContent = current || "Pilih drive atau lokasi";
+        up.disabled = !data.parent;
+        up.onclick = () => load(data.parent || "");
+        roots.innerHTML = (data.roots || []).map((r) =>
+          `<button type="button" class="chip" data-root="${esc(r.path)}">${esc(r.name)}</button>`).join("");
+        $$("[data-root]", roots).forEach((b) => b.onclick = () => load(b.dataset.root));
+        if (choose) choose.disabled = false;
         if (!data.entries || !data.entries.length) {
           list.innerHTML = `<div class="empty">${current ? "Folder kosong" : "Pilih drive di atas"}</div>`;
           return;
         }
         list.innerHTML = data.entries.map((e) => `
-          <button data-path="${esc(e.path)}" data-dir="${e.is_dir ? 1 : 0}">
+          <button type="button" data-path="${esc(e.path)}" data-dir="${e.is_dir ? 1 : 0}">
             <span>${e.is_dir ? "📁" : "📄"}</span><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis">${esc(e.name)}</span>
             <span class="muted small">${e.is_dir ? "" : fmtSize(e.size)}</span></button>`).join("");
         $$("button[data-path]", list).forEach((b) => b.onclick = () => {
@@ -261,12 +316,17 @@
           if (mode === "file" || mode === "any") { m.close(); onPick(b.dataset.path); }
         });
       } catch (err) {
-        $("br-list").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+        if (!fresh()) return;
+        const list = q("br-list");
+        if (list) list.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+        if (choose) choose.disabled = false;
       }
     };
-    const choose = $("br-choose");
+    const choose = q("br-choose");
     if (choose) choose.onclick = () => {
-      if (mode === "save") { m.close(); onPick(current.replace(/[\\/]$/, "") + "/" + ($("br-name").value || "hasil")); }
+      if (!m.isOpen()) return;
+      const nameEl = q("br-name");
+      if (mode === "save") { m.close(); onPick(current.replace(/[\\/]$/, "") + "/" + ((nameEl && nameEl.value) || "hasil")); }
       else { m.close(); onPick(current); }
     };
     load(current);
@@ -285,6 +345,10 @@
   }
 
   async function startJob(path, body, handlerName) {
+    if (state.job) {
+      toast("Pekerjaan lain berjalan", "Tunggu sampai selesai atau batalkan dulu.", "err");
+      return false;
+    }
     try {
       await api(path, { method: "POST", body });
       state.job = { name: handlerName };
@@ -300,8 +364,30 @@
   }
 
   // Controls that must not start a second job while one runs.
+  // A button is disabled when a job runs, when its source is a stuck device (data-stuck, set by
+  // refreshStuck) or when it needs a selection that is missing.
+  function selectionBlocks(id) {
+    if (id === "trash-restore") return state.trashSel.size === 0;
+    if (id === "fs-recover") return state.fsSel.size === 0;
+    if (id === "fs-preview") return state.fsSel.size !== 1;
+    return false;
+  }
   function syncRunning() {
-    setBusyButton($("cap-start"), !!state.job, "Pekerjaan berjalan…");
+    const busy = !!state.job;
+    setBusyButton($("cap-start"), busy, "Pekerjaan berjalan…");
+    JOB_BUTTONS.forEach((id) => {
+      const b = $(id);
+      if (!b) return;
+      b.disabled = busy || !!b.dataset.stuck || selectionBlocks(id);
+      if (b.dataset.stuck) b.title = STUCK_TIP;
+      else if (busy) {
+        if (b.dataset.busyTitle === undefined) b.dataset.busyTitle = b.title || "";
+        b.title = BUSY_TIP;
+      } else if (b.dataset.busyTitle !== undefined) {
+        b.title = b.dataset.busyTitle;
+        delete b.dataset.busyTitle;
+      }
+    });
   }
 
   function showJobBar(name, phase, percent) {
@@ -319,7 +405,13 @@
     state.pollTimer = setTimeout(async () => {
       try {
         const job = await api("/api/job");
-        if (job.state === "idle") return;
+        state.pollFailures = 0;
+        if (job.state === "idle") {
+          state.job = null;
+          $("jobbar").hidden = true;
+          syncRunning();
+          return;
+        }
         showJobBar(job.name, job.phase + (job.text ? ` — ${job.text}` : ""), job.percent);
         const parts = [];
         if (job.status_line) parts.push(`<span><b>${esc(job.status_line)}</b></span>`);
@@ -332,7 +424,16 @@
         syncRunning();
         onJobDone(job);
       } catch (err) {
+        // A single failed request (busy server, brief network blip) must not drop the job.
+        // Keep polling and give up only after several failures in a row.
+        state.pollFailures = (state.pollFailures || 0) + 1;
+        if (state.pollFailures < 5) {
+          $("job-phase").textContent = `Menunggu server… (percobaan ${state.pollFailures})`;
+          poll();
+          return;
+        }
         toast("Koneksi putus", err.message, "err");
+        state.pollFailures = 0;
         state.job = null;
         syncRunning();
         $("jobbar").hidden = true;
@@ -348,12 +449,20 @@
     if (CAPACITY_ALIASES.has(name)) name = "capacity";
     else if (!KNOWN_JOBS.has(name) && state.lastHandler) name = state.lastHandler;
     switch (name) {
-      case "trash_restore":
-        toast("Selesai", `${r.ok} dari ${r.total} file dipulihkan ke ${r.dest}`, "ok"); loadTrash(); break;
+      case "trash_restore": {
+        const issues = problemText(r.errors);
+        toast("Selesai", `${r.ok} dari ${r.total} file dipulihkan ke ${r.dest}` + (issues ? `. Masalah: ${issues}` : ""),
+          issues ? "err" : "ok");
+        loadTrash(); break;
+      }
       case "fs_scan":
         toast("Pemindaian selesai", `${r.count} file dihapus ditemukan`, "ok"); loadFs(); break;
-      case "fs_recover":
-        toast("Pemulihan selesai", `${r.ok} dari ${r.total} file ke ${r.dest}`, "ok"); break;
+      case "fs_recover": {
+        const issues = problemText(r.problems);
+        toast("Pemulihan selesai", `${r.ok} dari ${r.total} file ke ${r.dest}` + (issues ? `. Masalah: ${issues}` : ""),
+          issues ? "err" : "ok");
+        break;
+      }
       case "fs_preview":
         showPreview(r); break;
       case "carve":
@@ -366,10 +475,14 @@
         break;
       case "capacity":
         renderCapacity(r, job.state === "cancelled"); break;
-      case "image":
-        $("image-result").innerHTML = `${job.state === "cancelled" ? "<b>Dibatalkan.</b> " : ""}Disalin ${fmtSize(r.bytes)} dari ${fmtSize(r.total)}.<br>
+      case "image": {
+        const cancelled = job.state === "cancelled" || r.cancelled === true;
+        $("image-result").innerHTML = `${cancelled ? "<b>Salin disk dibatalkan.</b> " : ""}Disalin ${fmtSize(r.bytes)} dari ${fmtSize(r.total)}.<br>
           SHA-256: <code>${esc(r.sha256)}</code>${r.bad_blocks ? `<br><span class="tag warn">${r.bad_blocks} blok rusak diisi nol</span>` : ""}`;
-        toast("Salin disk selesai", fmtSize(r.bytes), "ok"); break;
+        // job.state "cancelled" already raised a "Dibatalkan" toast above
+        if (job.state !== "cancelled") toast(cancelled ? "Salin disk dibatalkan" : "Salin disk selesai", fmtSize(r.bytes), cancelled ? "info" : "ok");
+        break;
+      }
       case "repair":
         renderRepair(r); toast("Perbaikan selesai", `${r.ok} dari ${r.total} file`, "ok"); break;
       case "flash_diag":
@@ -397,20 +510,30 @@
   }
   function renderTrash() {
     $("trash-count").textContent = state.trash.length;
-    $("trash-selected").textContent = state.trashSel.size;
-    $("trash-restore").disabled = state.trashSel.size === 0;
-    $("trash-body").innerHTML = state.trash.length ? state.trash.map((it) => `
+    $("trash-body").innerHTML = state.trash.length ? state.trash.slice(0, MAX_ROWS).map((it) => `
       <tr class="${state.trashSel.has(it.id) ? "selected" : ""}" data-id="${it.id}">
-        <td><input type="checkbox" data-id="${it.id}" ${state.trashSel.has(it.id) ? "checked" : ""}></td>
+        <td><input type="checkbox" data-id="${it.id}" aria-label="Pilih ${esc(it.name)}" ${state.trashSel.has(it.id) ? "checked" : ""}></td>
         <td>${esc(it.name)}</td><td class="num">${fmtSize(it.size)}</td>
         <td>${fmtDate(it.deleted)}</td><td class="path" title="${esc(it.original || "")}">${esc(it.original || "-")}</td></tr>`).join("")
       : `<tr><td colspan="5" class="empty">Tidak ada item. Coba ubah filter tanggal.</td></tr>`;
-    $$("#trash-body input[type=checkbox]").forEach((cb) => cb.onchange = () => {
-      const id = Number(cb.dataset.id);
-      cb.checked ? state.trashSel.add(id) : state.trashSel.delete(id);
-      renderTrash();
+    limitNote("trash-limit", state.trash.length);
+    syncTrashSelection();
+  }
+  // Counters, buttons and select-all state after a selection change (no table rebuild).
+  function syncTrashSelection() {
+    $("trash-selected").textContent = state.trashSel.size;
+    const all = $("trash-all");
+    all.checked = state.trash.length > 0 && state.trashSel.size === state.trash.length;
+    all.indeterminate = state.trashSel.size > 0 && state.trashSel.size < state.trash.length;
+    syncRunning();
+  }
+  // Sets every drawn row's checkbox / row class from the selection set (used by select-all).
+  function syncRows(bodyId, sel) {
+    $$(`#${bodyId} input[type=checkbox][data-id]`).forEach((cb) => {
+      const on = sel.has(Number(cb.dataset.id));
+      cb.checked = on;
+      cb.closest("tr").classList.toggle("selected", on);
     });
-    $("trash-all").checked = state.trash.length > 0 && state.trashSel.size === state.trash.length;
   }
 
   // ---------- File system (names) ----------
@@ -435,21 +558,18 @@
     $$(".fs-status-col").forEach((th) => th.hidden = !withStatus);
     const cols = withStatus ? 6 : 5;
     $("fs-shown").textContent = shown.length;
-    $("fs-selected").textContent = state.fsSel.size;
-    $("fs-recover").disabled = state.fsSel.size === 0;
-    $("fs-preview").disabled = state.fsSel.size !== 1;
     $("fs-body").innerHTML = shown.length ? shown.slice(0, MAX_ROWS).map((e) => `
       <tr class="${state.fsSel.has(e.id) ? "selected" : ""}">
-        <td><input type="checkbox" data-id="${e.id}" ${state.fsSel.has(e.id) ? "checked" : ""}></td>
+        <td><input type="checkbox" data-id="${e.id}" aria-label="Pilih ${esc(facts(e).name || e.path)}" ${state.fsSel.has(e.id) ? "checked" : ""}></td>
         <td class="path" title="${esc(e.path)}">${esc(e.path)}</td><td class="num">${fmtSize(e.size)}</td>
         <td><span class="tag">${esc(e.fs)}</span></td>${withStatus ? `<td>${statusTag(facts(e).status)}</td>` : ""}<td>${fmtDate(e.deleted)}</td></tr>`).join("")
       : `<tr><td colspan="${cols}" class="empty">${state.fs.length ? "Tidak ada file yang cocok dengan filter." : "Belum ada hasil. Jalankan pencarian dulu."}</td></tr>`;
     limitNote("fs-limit", shown.length);
-    $$("#fs-body input[type=checkbox]").forEach((cb) => cb.onchange = () => {
-      const id = Number(cb.dataset.id);
-      cb.checked ? state.fsSel.add(id) : state.fsSel.delete(id);
-      renderFs();
-    });
+    syncFsSelection();
+  }
+  function syncFsSelection() {
+    $("fs-selected").textContent = state.fsSel.size;
+    syncRunning();  // fs-recover / fs-preview depend on the selection and on a running job
   }
 
   async function exportFs(format) {
@@ -476,7 +596,17 @@
     const m = modal(`Pratinjau: ${r.name}`, `${r.partial ? `<span class="tag warn">data tidak lengkap</span> ` : ""}
       <span class="muted small">${fmtSize(r.size)}</span><div style="margin-top:12px">${body}</div>`);
     if (!body.includes("<img")) {
-      fetch(r.url).then((res) => res.arrayBuffer()).then((buf) => {
+      const pvText = () => m.root.querySelector("#pv-text");
+      fetch(r.url).then(async (res) => {
+        if (!res.ok) {
+          let msg = `HTTP ${res.status}`;
+          try { const d = await res.json(); if (d && d.error) msg = d.error; } catch (_) { /* not JSON */ }
+          throw new Error(msg);
+        }
+        return res.arrayBuffer();
+      }).then((buf) => {
+        const el = pvText();
+        if (!el) return;  // dialog closed meanwhile
         const bytes = new Uint8Array(buf).slice(0, 4096);
         const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
         const printable = /^[\x09\x0a\x0d\x20-\x7e -￿]*$/.test(text.slice(0, 512));
@@ -484,33 +614,55 @@
         if (!printable || ![".txt", ".csv", ".log", ".xml", ".json", ".md", ".html", ".py", ".ini", ".cfg"].includes(kind)) {
           out = Array.from(bytes.slice(0, 512)).map((b, i) => (i % 16 === 0 ? (i ? "\n" : "") + i.toString(16).padStart(8, "0") + "  " : "") + b.toString(16).padStart(2, "0") + " ").join("");
         }
-        $("pv-text").textContent = out || "(kosong)";
-      }).catch((err) => { $("pv-text").textContent = "Gagal memuat: " + err.message; });
+        el.textContent = out || "(kosong)";
+      }).catch((err) => {
+        const el = pvText();
+        if (el) el.textContent = "Pratinjau tidak bisa dimuat: " + err.message;
+        toast("Pratinjau gagal", err.message, "err");
+      });
     }
     m.root.querySelector(".modal").dataset.kind = kind;
   }
 
   // ---------- Carving ----------
 
+  // File-type toggles: real buttons with aria-pressed, built once and updated in place (keeps focus).
   function renderChips() {
     $("ext-chips").innerHTML = EXTS.map((e) =>
-      `<span class="chip ${state.exts.has(e) ? "on" : ""}" data-ext="${e}">${e.toUpperCase()}</span>`).join("");
+      `<button type="button" class="chip" data-ext="${e}" aria-pressed="false">${e.toUpperCase()}</button>`).join("");
     $$("#ext-chips .chip").forEach((c) => c.onclick = () => {
       const e = c.dataset.ext;
       state.exts.has(e) ? state.exts.delete(e) : state.exts.add(e);
-      renderChips();
+      syncChips();
+    });
+    syncChips();
+  }
+  function syncChips() {
+    $$("#ext-chips .chip").forEach((c) => {
+      const on = state.exts.has(c.dataset.ext);
+      c.classList.toggle("on", on);
+      c.setAttribute("aria-pressed", on ? "true" : "false");
     });
   }
 
-  // The carve result may carry a per-file list (with an optional 'confidence' field).
+  // The carve result may carry a per-file list (with an optional 'confidence' field). The current
+  // server sends counts only, so the file card stays hidden unless real rows arrive.
   function setCarveFiles(r) {
     const list = [r.files, r.items, r.results, r.recovered_files, r.recovered].find(Array.isArray);
     state.carve = (list || []).filter((x) => x && typeof x === "object");
-    $("carve-files-card").hidden = !state.carve.length;
     state.filters.carve.setItems(state.carve);
     renderCarve();
   }
   function renderCarve() {
+    const has = state.carve.length > 0;
+    $("carve-files-card").hidden = !has;
+    $("carve-filters").hidden = !has;
+    if (!has) {
+      $$(".carve-conf-col").forEach((el) => el.hidden = true);
+      $("carve-body").innerHTML = "";
+      $("carve-limit").hidden = true;
+      return;
+    }
     const shown = state.filters.carve.apply(state.carve);
     const hasConf = state.carve.some((it) => facts(it).confidence);
     $$(".carve-conf-col").forEach((el) => el.hidden = !hasConf);
@@ -551,7 +703,7 @@
     else if (r.ok === false || r.genuine === false || r.passed === false || r.fake === true) tone = "bad";
     else if (/palsu|fake|rusak|gagal|tidak cocok|error/i.test(verdict)) tone = "bad";
     const [, written] = firstOf(r, ["bytes_written", "written_bytes", "written"]);
-    const [, verified] = firstOf(r, ["bytes_verified", "verified_bytes", "verified", "bytes_ok"]);
+    const [, verified] = firstOf(r, ["bytes_verified_ok", "bytes_verified", "verified_bytes", "verified", "bytes_ok"]);
     // Server contract: write_mb_per_s / read_mb_per_s are always MB/s
     const write = [null, r.write_mb_per_s ?? null];
     const read = [null, r.read_mb_per_s ?? null];
@@ -582,6 +734,13 @@
       ${r.partitions && r.partitions.length ? `<div class="muted small">Partisi: ${esc(r.partitions.join(", "))}</div>` : ""}`;
   }
   function renderSurface(r) {
+    if (r.stuck) {
+      // the scan stopped because the device stopped answering: say so, not "healthy" / "N bad ranges"
+      $("flash-result").innerHTML = `<p><span class="tag warn">TIDAK MERESPONS</span> <span class="muted">${esc(r.message || STUCK_TIP)}</span></p>`;
+      toast("Uji permukaan berhenti", r.message || STUCK_TIP, "err");
+      loadDisks();  // pick up the server's stuck flag so the buttons for this device lock
+      return;
+    }
     const body = r.healthy
       ? `<span class="tag ok">SEHAT</span> <span class="muted">${fmtSize(r.bytes_read)} dibaca, tidak ada sektor rusak.</span>`
       : `<span class="tag bad">${r.bad_count} RENTANG RUSAK</span> <span class="muted">${fmtSize(r.bad_bytes)} tidak terbaca. Salin ke image sebelum perbaikan.</span>`;
@@ -647,6 +806,7 @@
         }
       });
     });
+    syncRunning();  // a device that is no longer stuck must still stay locked while a job runs
   }
 
   // ---------- events ----------
@@ -672,8 +832,26 @@
     $("trash-clear").onclick = () => { $("trash-from").value = ""; $("trash-to").value = ""; loadTrash(); };
     $("trash-all").onchange = (e) => {
       state.trashSel = e.target.checked ? new Set(state.trash.map((t) => t.id)) : new Set();
-      renderTrash();
+      syncRows("trash-body", state.trashSel);
+      syncTrashSelection();
     };
+    // row checkboxes: one delegated listener, update the row and counters in place
+    $("trash-body").addEventListener("change", (e) => {
+      const cb = e.target.closest("input[type=checkbox][data-id]");
+      if (!cb) return;
+      const id = Number(cb.dataset.id);
+      cb.checked ? state.trashSel.add(id) : state.trashSel.delete(id);
+      cb.closest("tr").classList.toggle("selected", cb.checked);
+      syncTrashSelection();
+    });
+    $("fs-body").addEventListener("change", (e) => {
+      const cb = e.target.closest("input[type=checkbox][data-id]");
+      if (!cb) return;
+      const id = Number(cb.dataset.id);
+      cb.checked ? state.fsSel.add(id) : state.fsSel.delete(id);
+      cb.closest("tr").classList.toggle("selected", cb.checked);
+      syncFsSelection();
+    });
     $("trash-restore").onclick = () => openBrowser({
       mode: "dir", title: "Pilih folder tujuan",
       onPick: (dest) => startJob("/api/trash/restore", { ids: [...state.trashSel], dest }, "trash_restore"),
@@ -683,8 +861,10 @@
     $("fs-scan").onclick = () => {
       const source = $("fs-src").value.trim();
       if (!source) return toast("Sumber kosong", "Pilih disk atau file image dulu.", "err");
-      state.fsSel.clear();
-      startJob("/api/fs/scan", { source, ...dateRange("fs-from", "fs-to") }, "fs_scan");
+      startJob("/api/fs/scan", { source, ...dateRange("fs-from", "fs-to") }, "fs_scan").then((ok) => {
+        // drop the old selection only once the server accepted the scan (a 409 keeps it)
+        if (ok) { state.fsSel.clear(); syncRows("fs-body", state.fsSel); syncFsSelection(); }
+      });
     };
     $("fs-from").onchange = loadFs;
     $("fs-to").onchange = loadFs;
@@ -693,7 +873,8 @@
       const ids = (state.fsShown || state.fs).map((e) => e.id);
       const allOn = ids.length > 0 && ids.every((id) => state.fsSel.has(id));
       ids.forEach((id) => allOn ? state.fsSel.delete(id) : state.fsSel.add(id));
-      renderFs();
+      syncRows("fs-body", state.fsSel);
+      syncFsSelection();
     };
     $("fs-preview").onclick = () => {
       const [id] = [...state.fsSel];
@@ -713,8 +894,8 @@
 
     // carving
     renderChips();
-    $("ext-all").onclick = () => { state.exts = new Set(EXTS); renderChips(); };
-    $("ext-none").onclick = () => { state.exts = new Set(); renderChips(); };
+    $("ext-all").onclick = () => { state.exts = new Set(EXTS); syncChips(); };
+    $("ext-none").onclick = () => { state.exts = new Set(); syncChips(); };
     $("carve-start").onclick = () => {
       const source = $("carve-src").value.trim(), out = $("carve-out").value.trim();
       if (!source || !out) return toast("Lengkapi isian", "Sumber dan folder hasil wajib diisi.", "err");
@@ -824,7 +1005,10 @@
 
   function startDebug() {
     stopDebug();
+    const gen = (state.debugGen || 0) + 1;
+    state.debugGen = gen;
     const tick = async () => {
+      if (gen !== state.debugGen) return;
       try {
         const [logs, dbg] = await Promise.all([
           api("/api/logs?since=" + state.lastSeq),
@@ -836,11 +1020,15 @@
         if (logs.lines.length) appendLogs(logs.lines);
         state.lastSeq = logs.last;
       } catch (err) { $("dbg-state").textContent = "terputus"; }
-      state.debugTimer = setTimeout(tick, 800);
+      if (gen === state.debugGen) state.debugTimer = setTimeout(tick, 800);
     };
     tick();
   }
-  function stopDebug() { clearTimeout(state.debugTimer); state.debugTimer = null; }
+  function stopDebug() {
+    state.debugGen = (state.debugGen || 0) + 1;   // invalidates any tick still awaiting fetches
+    clearTimeout(state.debugTimer);
+    state.debugTimer = null;
+  }
 
   function renderDebugStatus(dbg) {
     const j = dbg.job || {};
@@ -872,16 +1060,15 @@
     });
     box.appendChild(frag);
     while (box.children.length > 2000) box.removeChild(box.firstChild);
-    renderLogFilter();
+    // level filtering is a data attribute on the container + CSS, so new lines need no per-node work
     if ($("dbg-follow").checked) box.scrollTop = box.scrollHeight;
     $("dbg-count").textContent = `${box.children.length} baris`;
   }
+  // Minimum level lives on the container (data-min); app.css hides lower-level lines.
   function renderLogFilter() {
+    const box = $("dbg-log");
     const level = $("dbg-level").value;
-    Array.from($("dbg-log").children).forEach((d) => {
-      const order = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"];
-      d.hidden = level !== "ALL" && order.indexOf(d.dataset.level) < order.indexOf(level);
-    });
+    if (level === "ALL") delete box.dataset.min; else box.dataset.min = level;
   }
 
   // ---------- start ----------

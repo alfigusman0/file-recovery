@@ -146,7 +146,7 @@ def _zip_datetime(data: bytes) -> Optional[dt.datetime]:
     hour = dos_time >> 11
     minute = (dos_time >> 5) & 0x3F
     second = (dos_time & 0x1F) * 2
-    if year < 1981 or not (1 <= month <= 12) or not (1 <= day <= 31):
+    if year < 1980 or not (1 <= month <= 12) or not (1 <= day <= 31):
         return None
     try:
         return dt.datetime(year, month, day, min(hour, 23), min(minute, 59), min(second, 59))

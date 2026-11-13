@@ -143,7 +143,8 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- plumbing ----------
 
     def log_message(self, fmt, *args):  # route HTTP access log into our log file
-        log.debug("http %s", fmt % args)
+        # Drop query strings: preview URLs carry the session token in ?token=
+        log.debug("http %s", (fmt % args).split("?", 1)[0])
 
     def _send(self, status: int, body: bytes, content_type: str = "application/json; charset=utf-8",
               headers: Optional[dict] = None) -> None:
@@ -178,6 +179,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
+        if length < 0:
+            raise ValueError("Content-Length tidak valid")
         if length > 1_000_000:
             raise ValueError("permintaan terlalu besar")
         raw = self.rfile.read(length) if length else b"{}"
@@ -233,7 +236,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _serve_static(self, name: str) -> None:
         name = unquote(name)
-        if "/" in name or "\\" in name or name.startswith("."):
+        # ":" must be refused too: on Windows "D:file" makes os.path.join jump to drive D:.
+        if any(c in name for c in "/\\:") or name.startswith("."):
             return self._error(HTTPStatus.NOT_FOUND, "tidak ditemukan")
         path = os.path.join(STATIC_DIR, name)
         if not os.path.isfile(path):
@@ -293,7 +297,7 @@ class Handler(BaseHTTPRequestHandler):
     def _serve_preview(self, name: str, token: str) -> None:
         if not secrets.compare_digest(token, self.app.token):
             return self._error(HTTPStatus.FORBIDDEN, "token diperlukan")
-        if "/" in name or "\\" in name or name.startswith("."):
+        if any(c in name for c in "/\\:") or name.startswith("."):
             return self._error(HTTPStatus.BAD_REQUEST, "nama tidak valid")
         path = os.path.join(self.app.preview_dir, name)
         if not os.path.isfile(path):
@@ -497,7 +501,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/image":
             source = self._need(body, "source")
             out = self._need(body, "out")
-            check_destination(source, os.path.dirname(os.path.abspath(out)))
+            check_destination(source, out)   # the image file itself, never a device or its parent folder
 
             def run(job):
                 def track(done, total):

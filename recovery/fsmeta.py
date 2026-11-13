@@ -253,11 +253,17 @@ class PartialRecoveryError(IOError):
     """Raised when fewer bytes than the recorded size could be read."""
 
 
+class RecoveryCancelledError(PartialRecoveryError):
+    """Raised when the user cancels in the middle of a file (the partial file is removed)."""
+
+
 def read_entry(entry: DeletedEntry, dest_path: str, cancel: Optional[threading.Event] = None) -> int:
     """Copy one deleted entry's data to dest_path. Returns bytes written.
 
     Raises PartialRecoveryError when the data cannot be read in full (the partial
-    file is kept, so the user can inspect it). Cancelled copies are not errors.
+    file is kept, so the user can inspect it). Raises RecoveryCancelledError when
+    cancelled before the file was complete; the truncated file is removed, so it
+    is never mistaken for a recovered file.
     """
     _require_tsk()
     if entry.fs_handle is None:
@@ -265,10 +271,12 @@ def read_entry(entry: DeletedEntry, dest_path: str, cancel: Optional[threading.E
     f = entry.fs_handle.open_meta(inode=entry.inode)
     os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
     written = 0
+    cancelled = False
     with open(dest_path, "wb") as out:
         offset = 0
         while offset < entry.size:
             if cancel is not None and cancel.is_set():
+                cancelled = True
                 break
             want = min(READ_BLOCK, entry.size - offset)
             data = f.read_random(offset, want)
@@ -277,7 +285,13 @@ def read_entry(entry: DeletedEntry, dest_path: str, cancel: Optional[threading.E
             out.write(data)
             written += len(data)
             offset += len(data)
-    if written < entry.size and not (cancel is not None and cancel.is_set()):
+    if cancelled:
+        try:
+            os.remove(dest_path)
+        except OSError:
+            pass
+        raise RecoveryCancelledError(f"dibatalkan setelah {written} dari {entry.size} byte")
+    if written < entry.size:
         raise PartialRecoveryError(f"hanya {written} dari {entry.size} byte yang bisa dibaca")
     return written
 
@@ -328,6 +342,10 @@ def recover_entries(
         try:
             written = read_entry(e, dest, cancel)
             results.append((dest, written, None))
+        except RecoveryCancelledError as exc:
+            # Not recovered: the truncated file was removed. Stop the batch here.
+            results.append((dest, 0, f"dibatalkan: {exc}"))
+            break
         except PartialRecoveryError as exc:
             partial = os.path.getsize(dest) if os.path.exists(dest) else 0
             results.append((dest, partial, f"sebagian: {exc}"))

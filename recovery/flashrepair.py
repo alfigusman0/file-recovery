@@ -303,7 +303,9 @@ def run_repair(cmd: list[str], timeout: int = 3600, runner: Optional[Callable] =
         return runner(cmd)
     if shutil.which(cmd[0]) is None:
         raise RuntimeError(f"Perintah {cmd[0]} tidak ditemukan di sistem ini")
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+    # stdin=DEVNULL: chkdsk may ask a Y/N question; with no input it must not wait forever.
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False,
+                          stdin=subprocess.DEVNULL)
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 

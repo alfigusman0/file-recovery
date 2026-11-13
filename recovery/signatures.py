@@ -23,6 +23,7 @@ from typing import Callable, Optional
 
 from .formats import (
     MOV_BRANDS,
+    gif_walk,
     id3v2_size,
     jpeg_header_ok,
     jpeg_scan_start,
@@ -123,8 +124,10 @@ SIGNATURES: list[Signature] = [
     # and the segment chain, so an embedded EXIF thumbnail SOI is also accepted only if valid.
     Signature("jpeg", "jpg", b"\xff\xd8\xff", b"\xff\xd9", 30 * MB, check=_jpeg, scan_start=jpeg_scan_start),
     Signature("png", "png", b"\x89PNG\r\n\x1a\n", b"IEND\xaeB`\x82", 30 * MB),
-    Signature("gif", "gif", b"GIF87a", b"\x00\x3b", 20 * MB),
-    Signature("gif", "gif", b"GIF89a", b"\x00\x3b", 20 * MB),
+    # GIF: the 00 3B byte pair also occurs inside LZW data, so the end is found by
+    # walking the block structure to the 0x3B trailer instead of a footer search.
+    Signature("gif", "gif", b"GIF87a", None, 20 * MB, walk=gif_walk),
+    Signature("gif", "gif", b"GIF89a", None, 20 * MB, walk=gif_walk),
     Signature("pdf", "pdf", b"%PDF-", b"%%EOF", 500 * MB, footer_last=True),
     # ZIP-based formats (DOCX, XLSX, PPTX, APK, JAR): end at the End Of Central Directory record.
     Signature("zip", "zip", b"PK\x03\x04", b"PK\x05\x06", 2000 * MB, footer_extra=18),

@@ -26,7 +26,8 @@ class UnsafeDestinationError(ValueError):
 
 def is_device_path(source: str) -> bool:
     if current_os() == "windows":
-        upper = source.upper()
+        # Windows accepts forward slashes too: "//./G:" opens the raw volume just like "\\.\G:".
+        upper = source.replace("/", "\\").upper()
         return (upper.startswith(("\\\\.\\", "\\\\?\\")) and not upper.startswith("\\\\?\\UNC\\")) \
             and not os.path.isfile(source)
     return source.startswith("/dev/")
@@ -168,10 +169,16 @@ def check_destination(source: str, destination: str) -> None:
     """Raise UnsafeDestinationError if destination may be on the same disk as a raw device source."""
     if not destination:
         raise UnsafeDestinationError("Folder tujuan belum dipilih")
+    # Output must always be a file or folder, never a raw device (writing to \\.\PhysicalDriveN
+    # would overwrite a whole disk, including the system disk).
+    if is_device_path(destination) or destination.replace("/", "\\").upper().startswith(("\\\\.\\", "\\\\?\\")):
+        raise UnsafeDestinationError("Tujuan tidak boleh berupa perangkat. Pilih folder atau file biasa.")
     if not is_device_path(source):
         return  # image file or folder: reading it never overwrites recovered data
 
     os_name = current_os()
+    if os_name == "windows":
+        source = source.replace("/", "\\")
     if os_name == "windows":
         _check_windows(source, destination)
     else:
